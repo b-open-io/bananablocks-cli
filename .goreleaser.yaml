@@ -1,0 +1,57 @@
+# GoReleaser configuration — https://goreleaser.com
+# Cuts cross-platform archives + checksums for `bb` on a tag push (see
+# .github/workflows/release.yml). Validate locally with `goreleaser check`.
+version: 2
+
+project_name: bb
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: bb
+    main: ./cmd/bb
+    binary: bb
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    # Match the Makefile's ldflags so `bb version` reports the release tag.
+    ldflags:
+      - -s -w -X github.com/b-open-io/bananablocks-cli/internal/cmd.Version={{ .Version }}
+
+archives:
+  - id: bb
+    formats:
+      - tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
+
+release:
+  draft: false
+  prerelease: auto

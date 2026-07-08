@@ -255,6 +255,21 @@ func TestPayChallengeSettlesInline(t *testing.T) {
 	}
 }
 
+// TestEnsureNotExpired confirms an already-expired challenge is rejected before
+// any signing/submission, while a still-valid (or expiry-less) one passes.
+func TestEnsureNotExpired(t *testing.T) {
+	expired := &x402.Challenge{ExpiresAt: time.Now().Add(-time.Minute)}
+	if err := ensureNotExpired(expired); err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("expired challenge should be rejected, got %v", err)
+	}
+	if err := ensureNotExpired(&x402.Challenge{ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+		t.Fatalf("valid challenge should pass, got %v", err)
+	}
+	if err := ensureNotExpired(&x402.Challenge{}); err != nil {
+		t.Fatalf("zero-expiry challenge should pass, got %v", err)
+	}
+}
+
 // TestSubmitPath covers pay_url resolution: empty falls back to the canonical
 // path, same-host relative/absolute URLs (with query) are honored, and a
 // cross-origin absolute URL is refused so the Bearer key can't leak.

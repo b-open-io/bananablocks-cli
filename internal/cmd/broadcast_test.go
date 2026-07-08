@@ -62,3 +62,13 @@ func TestReadTxHexArgRejectsNonFile(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+// TestReadTxHexArgOddLengthHex confirms a plain-string all-hex argument with an
+// odd number of digits reports that precisely rather than the misleading
+// "neither valid hex nor an existing file".
+func TestReadTxHexArgOddLengthHex(t *testing.T) {
+	_, err := readTxHexArg("0100beef0") // 9 hex digits
+	if err == nil || !strings.Contains(err.Error(), "odd number of digits") {
+		t.Fatalf("got %v, want an odd-length-hex error", err)
+	}
+}

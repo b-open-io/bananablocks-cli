@@ -50,8 +50,9 @@ stream bytes to stdout instead.`,
 		}
 		path := "/api/v1/tx/" + url.PathEscape(txid) + "/" + kind + "/" + strconv.Itoa(vout)
 		// Stream the content straight to its sink; on-chain media can be large,
-		// so it is never fully buffered in memory.
-		body, hdr, err := client().Stream(cmd.Context(), path, nil)
+		// so it is never fully buffered in memory. streamClient omits the overall
+		// HTTP timeout, which would otherwise abort a long download mid-copy.
+		body, hdr, err := streamClient().Stream(cmd.Context(), path, nil)
 		if err != nil {
 			return err
 		}

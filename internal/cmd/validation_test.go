@@ -28,6 +28,28 @@ func TestNormalizeTxID(t *testing.T) {
 	}
 }
 
+// TestValidateHostScheme confirms an unusable host scheme is rejected up front
+// with a clear message, while plain http/https (and bare hosts, which default
+// to https) pass.
+func TestValidateHostScheme(t *testing.T) {
+	old := flagHost
+	t.Cleanup(func() { flagHost = old })
+
+	for _, bad := range []string{"ftp://example.com", "ws://example.com", "file:///etc/passwd"} {
+		flagHost = bad
+		if err := validateHost(); err == nil || !strings.Contains(err.Error(), "unsupported host scheme") {
+			t.Errorf("host %q should be rejected, got %v", bad, err)
+		}
+	}
+
+	for _, ok := range []string{"http://example.com", "https://example.com", "example.com"} {
+		flagHost = ok
+		if err := validateHost(); err != nil {
+			t.Errorf("host %q should be accepted, got %v", ok, err)
+		}
+	}
+}
+
 func TestParseOutpointValidatesTxID(t *testing.T) {
 	// Non-hex 64-char txid is rejected.
 	if _, _, err := parseOutpoint(strings.Repeat("z", 64) + ":0"); err == nil {

@@ -91,6 +91,21 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	return nil, apiErr
 }
 
+// ReadBody reads a response body the caller obtained via Do/NewRequest, bounded
+// by maxBufferedResponse so a hostile or misconfigured host cannot stream
+// unbounded data into a caller that decodes the body itself (the JSON and Bytes
+// helpers apply the same cap internally).
+func (c *Client) ReadBody(r io.Reader) ([]byte, error) {
+	raw, err := io.ReadAll(io.LimitReader(r, maxBufferedResponse+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(raw)) > maxBufferedResponse {
+		return nil, fmt.Errorf("response exceeds %d bytes", maxBufferedResponse)
+	}
+	return raw, nil
+}
+
 // JSON performs a request and decodes the JSON response into out. Pass a
 // *json.RawMessage to keep the body verbatim.
 func (c *Client) JSON(ctx context.Context, method, path string, query url.Values, contentType string, body io.Reader, out any) error {

@@ -102,6 +102,10 @@ Use --dry-run to fetch and inspect the challenge without paying.`,
 			return render.JSON(cmd.OutOrStdout(), ch)
 		}
 
+		if err := ensureNotExpired(ch); err != nil {
+			return err
+		}
+
 		wif, err := fundingWIF()
 		if err != nil {
 			return err
@@ -169,6 +173,16 @@ func challengeFromResponse(apiErr *api.Error) (*x402.Challenge, error) {
 	return nil, fmt.Errorf("402 response carried no challenge: %s", apiErr.Message)
 }
 
+// ensureNotExpired rejects an already-expired challenge before any UTXO fetch,
+// signing, or payment prompt, rather than doing that work only for the server
+// to reject the submission with a 410.
+func ensureNotExpired(ch *x402.Challenge) error {
+	if !ch.ExpiresAt.IsZero() && time.Now().After(ch.ExpiresAt) {
+		return fmt.Errorf("challenge expired at %s; rerun to request a fresh one", ch.ExpiresAt.Format(time.RFC3339))
+	}
+	return nil
+}
+
 // submitProof POSTs the signed payment as an X402-Proof header and decodes
 // the settlement result.
 func submitProof(ctx context.Context, c *api.Client, ch *x402.Challenge, rawTx []byte, txid string) (*x402.UpgradeResult, error) {
@@ -195,8 +209,14 @@ func submitProof(ctx context.Context, c *api.Client, ch *x402.Challenge, rawTx [
 		return nil, err
 	}
 	defer resp.Body.Close()
+	// Bound the body like the client's JSON/Bytes paths do, rather than decoding
+	// straight from an unbounded network stream.
+	raw, err := c.ReadBody(resp.Body)
+	if err != nil {
+		return nil, err
+	}
 	var res x402.UpgradeResult
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+	if err := json.Unmarshal(raw, &res); err != nil {
 		return nil, fmt.Errorf("decoding upgrade result: %w", err)
 	}
 	return &res, nil
@@ -338,6 +358,9 @@ var errDeclined = errors.New("declined")
 // mirroring `bb key upgrade` minus the challenge fetch.
 func payChallenge(errw io.Writer, wif string, ch *x402.Challenge) error {
 	if err := ch.VerifyPayee(); err != nil {
+		return err
+	}
+	if err := ensureNotExpired(ch); err != nil {
 		return err
 	}
 	wallet, err := x402.NewWallet(wif, !upgradeTestnet)

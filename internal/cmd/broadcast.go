@@ -91,10 +91,15 @@ func readTxHexArg(arg string) (string, error) {
 	if hexRe.MatchString(s) && len(s)%2 == 0 {
 		return s, nil
 	}
-	// Not hex: a real file (or stdin) may hold raw binary — encode it. The
+	// Not clean hex: a real file (or stdin) may hold raw binary — encode it. The
 	// original bytes are encoded, not the whitespace-stripped view.
 	if arg == "-" || fileExists(arg) {
 		return hex.EncodeToString(raw), nil
+	}
+	// A plain-string argument that is all hex but odd-length is malformed hex,
+	// not a mystery input — say so precisely.
+	if hexRe.MatchString(s) {
+		return "", fmt.Errorf("%q looks like hex but has an odd number of digits (%d)", truncateArg(arg), len(s))
 	}
 	return "", fmt.Errorf("%q is neither valid hex nor an existing file", truncateArg(arg))
 }

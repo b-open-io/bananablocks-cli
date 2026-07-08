@@ -2,9 +2,12 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
+	"os/signal"
 	"strings"
 	"time"
 
@@ -41,9 +44,13 @@ Configuration:
 	SilenceErrors: true,
 }
 
-// Execute runs the root command, printing any error to stderr.
+// Execute runs the root command, printing any error to stderr. It installs a
+// signal-aware context so Ctrl-C cancels the command's context (which long-
+// running commands like `watch` observe) rather than only killing the process.
 func Execute() error {
-	err := rootCmd.Execute()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	err := rootCmd.ExecuteContext(ctx)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		offerUpgradeOn402(os.Stderr, err)
@@ -57,6 +64,22 @@ func init() {
 	pf.StringVar(&flagAPIKey, "api-key", "", "API key (env BB_API_KEY)")
 	pf.StringVar(&flagChain, "chain", "main", "chain segment for WhatsonChain-compatible endpoints")
 	pf.DurationVar(&flagTimeout, "timeout", 30*time.Second, "HTTP request timeout")
+	rootCmd.PersistentPreRunE = func(*cobra.Command, []string) error { return validateHost() }
+}
+
+// validateHost fails fast with a clear message when the resolved host carries
+// an unusable scheme, rather than surfacing an opaque error deep in request or
+// WebSocket construction.
+func validateHost() error {
+	h := host()
+	u, err := url.Parse(h)
+	if err != nil {
+		return fmt.Errorf("invalid host %q: %w", h, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("unsupported host scheme %q in %q (want http or https)", u.Scheme, h)
+	}
+	return nil
 }
 
 // host resolves the target server from flag, env, or default.
@@ -93,6 +116,18 @@ func client() *api.Client {
 		UserAgent: "bananablocks-cli/" + Version,
 		HTTP:      &http.Client{Timeout: flagTimeout},
 	}
+}
+
+// streamClient builds a client for streaming potentially large responses. Its
+// http.Client sets no overall Timeout — that would also bound the body read and
+// abort a long download mid-copy; instead the per-request timeout bounds only
+// how long the server may take to send response headers.
+func streamClient() *api.Client {
+	c := client()
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.ResponseHeaderTimeout = flagTimeout
+	c.HTTP = &http.Client{Transport: tr}
+	return c
 }
 
 // wocPath prefixes p with the WhatsonChain-compatible base for --chain.

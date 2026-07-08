@@ -35,8 +35,12 @@ equivalent. Query strings are passed through.`,
 		contentType := ""
 		if getPost || getData != "" {
 			method = http.MethodPost
-			contentType = "application/json"
 			body = strings.NewReader(getData)
+			// Only claim a JSON body when there is one; an empty body with
+			// Content-Type: application/json is malformed and strict servers 400.
+			if getData != "" {
+				contentType = "application/json"
+			}
 		} else {
 			body = strings.NewReader("")
 		}

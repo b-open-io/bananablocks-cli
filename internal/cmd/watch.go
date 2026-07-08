@@ -43,12 +43,18 @@ set. Interrupt (Ctrl-C) to stop.`,
 		ctx := cmd.Context()
 		backoff := time.Second
 		for {
-			err := streamOnce(cmd, wsURL, channels)
+			connected, err := streamOnce(cmd, wsURL, channels)
 			if ctx.Err() != nil {
 				return nil // interrupted
 			}
 			if watchNoReconnect {
 				return err
+			}
+			// A connection that actually established resets the backoff, so a
+			// long-lived stream that later drops reconnects promptly rather than
+			// inheriting the backoff grown during an earlier outage.
+			if connected {
+				backoff = time.Second
 			}
 			fmt.Fprintf(cmd.ErrOrStderr(), "connection lost (%v); reconnecting in %s\n", err, backoff)
 			select {
@@ -82,8 +88,9 @@ func websocketURL(base string) (string, error) {
 }
 
 // streamOnce connects, subscribes, and pumps messages until the connection
-// drops or the context is cancelled.
-func streamOnce(cmd *cobra.Command, wsURL string, channels []string) error {
+// drops or the context is cancelled. The returned bool reports whether the
+// connection was actually established, so the caller can reset its backoff.
+func streamOnce(cmd *cobra.Command, wsURL string, channels []string) (bool, error) {
 	ctx := cmd.Context()
 	dialer := websocket.Dialer{HandshakeTimeout: 15 * time.Second}
 	// The server's CheckOrigin rejects origin-less upgrades (non-browser
@@ -91,13 +98,13 @@ func streamOnce(cmd *cobra.Command, wsURL string, channels []string) error {
 	hdr := http.Header{"Origin": {host()}}
 	conn, _, err := dialer.DialContext(ctx, wsURL, hdr)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer conn.Close()
 
 	for _, ch := range channels {
 		if err := conn.WriteMessage(websocket.TextMessage, []byte("subscribe:"+ch)); err != nil {
-			return err
+			return true, err
 		}
 	}
 	fmt.Fprintf(cmd.ErrOrStderr(), "connected to %s, subscribed: %s\n", wsURL, strings.Join(channels, ", "))
@@ -117,7 +124,7 @@ func streamOnce(cmd *cobra.Command, wsURL string, channels []string) error {
 	for {
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
-			return err
+			return true, err
 		}
 		fmt.Fprintln(cmd.OutOrStdout(), string(msg))
 	}

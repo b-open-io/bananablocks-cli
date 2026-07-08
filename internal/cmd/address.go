@@ -50,7 +50,7 @@ var addressCmd = &cobra.Command{
 			path = base + "/tokens"
 		}
 		q := url.Values{}
-		if addrLimit > 0 {
+		if cmd.Flags().Changed("limit") {
 			q.Set("limit", strconv.Itoa(addrLimit))
 		}
 		if cmd.Flags().Changed("page") {

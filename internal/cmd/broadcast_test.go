@@ -72,3 +72,17 @@ func TestReadTxHexArgOddLengthHex(t *testing.T) {
 		t.Fatalf("got %v, want an odd-length-hex error", err)
 	}
 }
+
+// TestReadTxHexArgOddLengthHexFile confirms an odd-length all-hex FILE (a
+// truncated/corrupt hex dump) is flagged as malformed hex rather than silently
+// double-encoded and broadcast as a wrong transaction.
+func TestReadTxHexArgOddLengthHexFile(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "truncated.hex")
+	if err := os.WriteFile(f, []byte("0100beef0\n"), 0o644); err != nil { // 9 hex digits
+		t.Fatal(err)
+	}
+	_, err := readTxHexArg(f)
+	if err == nil || !strings.Contains(err.Error(), "odd number of digits") {
+		t.Fatalf("got %v, want an odd-length-hex error", err)
+	}
+}

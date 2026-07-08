@@ -93,6 +93,11 @@ func (w *Wallet) BuildPayment(ctx context.Context, c *api.Client, ch *Challenge,
 	if ch.AmountSats <= 0 {
 		return nil, fmt.Errorf("challenge amount %d is not payable", ch.AmountSats)
 	}
+	if feeRate == 0 {
+		// A zero rate builds a zero-fee transaction the broadcaster will reject;
+		// fail here with a clear message instead of after signing.
+		return nil, fmt.Errorf("fee rate must be at least 1 sat/kB")
+	}
 	payeeScript, err := script.NewFromHex(ch.PayeeLockingScriptHex)
 	if err != nil {
 		return nil, fmt.Errorf("challenge locking script: %w", err)
@@ -109,6 +114,10 @@ func (w *Wallet) BuildPayment(ctx context.Context, c *api.Client, ch *Challenge,
 	tx := transaction.NewTransaction()
 	var total int64
 	selected := 0
+	// Track added outpoints so a UTXO returned on more than one page (the set can
+	// shift between fetches) is not added twice, which would make an invalid tx
+	// with duplicate inputs.
+	seen := make(map[string]bool)
 
 	// Page through UTXOs (largest pages the API allows) until the target is
 	// covered. The legacy page path caps out at offset 1000, which is far more
@@ -129,6 +138,11 @@ func (w *Wallet) BuildPayment(ctx context.Context, c *api.Client, ch *Challenge,
 			if u.Value <= 0 {
 				continue
 			}
+			op := u.TxID + ":" + strconv.Itoa(u.Vout)
+			if seen[op] {
+				continue // already selected on an earlier page
+			}
+			seen[op] = true
 			if err := tx.AddInputFrom(u.TxID, uint32(u.Vout), w.lockHex, uint64(u.Value), unlocker); err != nil {
 				return nil, fmt.Errorf("adding input %s:%d: %w", u.TxID, u.Vout, err)
 			}

@@ -13,6 +13,18 @@ import (
 
 var watchNoReconnect bool
 
+const (
+	// maxBackoff caps the reconnect delay (clamped after doubling so it never
+	// overshoots the intended ceiling).
+	maxBackoff = 30 * time.Second
+	// pongWait is how long a read may sit idle before the connection is
+	// considered dead; pingPeriod (< pongWait) is how often we ping to keep a
+	// healthy connection's read deadline fresh.
+	pongWait   = 60 * time.Second
+	pingPeriod = (pongWait * 9) / 10
+	writeWait  = 10 * time.Second
+)
+
 var watchCmd = &cobra.Command{
 	Use:   "watch [channel...]",
 	Short: "Stream live events over WebSocket (blocks, mempool, address:<addr>, ...)",
@@ -62,8 +74,8 @@ set. Interrupt (Ctrl-C) to stop.`,
 				return nil
 			case <-time.After(backoff):
 			}
-			if backoff < 30*time.Second {
-				backoff *= 2
+			if backoff *= 2; backoff > maxBackoff {
+				backoff = maxBackoff
 			}
 		}
 	},
@@ -109,15 +121,39 @@ func streamOnce(cmd *cobra.Command, wsURL string, channels []string) (bool, erro
 	}
 	fmt.Fprintf(cmd.ErrOrStderr(), "connected to %s, subscribed: %s\n", wsURL, strings.Join(channels, ", "))
 
-	// Close the connection when the context is cancelled so ReadMessage
-	// unblocks promptly on Ctrl-C.
+	// Keepalive: bound each read with a deadline that pongs refresh, so a
+	// silently dropped connection (half-open TCP, no FIN) surfaces an error
+	// within pongWait instead of blocking ReadMessage forever and defeating the
+	// reconnect loop.
+	if err := conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
+		return true, err
+	}
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(pongWait))
+	})
+
+	// A single writer goroutine: it pings on a period and closes the connection
+	// when the context is cancelled so ReadMessage unblocks promptly on Ctrl-C.
+	// gorilla/websocket forbids concurrent writers, so all writes after
+	// subscription live here (the read loop below only reads).
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
-		select {
-		case <-ctx.Done():
-			conn.Close()
-		case <-done:
+		ticker := time.NewTicker(pingPeriod)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				conn.Close()
+				return
+			case <-done:
+				return
+			case <-ticker.C:
+				_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
+				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					return
+				}
+			}
 		}
 	}()
 

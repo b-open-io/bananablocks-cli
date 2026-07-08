@@ -1,5 +1,17 @@
-// Package spv verifies merkle proofs (TSC and BEEF/BUMP) locally, checking
-// the computed roots against block headers fetched from the API.
+// Package spv verifies merkle proofs (TSC and BEEF/BUMP) locally, checking the
+// computed roots against block headers fetched from the API.
+//
+// Trust boundary: this is NOT full SPV. The block headers the computed roots
+// are checked against come from the same API that supplies the proofs, and
+// their proof-of-work is not validated, nor are they cross-checked against an
+// independent header source. A single malicious or buggy server could therefore
+// return a fabricated proof together with a matching fabricated header and pass
+// verification. What this package does guarantee is internal consistency —
+// that the proof's own math is correct and agrees with the header the server
+// reports for the block — which catches proof corruption and endpoint bugs, but
+// does not remove trust in the server. Callers wanting a stronger guarantee
+// must validate header work and/or compare headers against an independent
+// source.
 package spv
 
 import (

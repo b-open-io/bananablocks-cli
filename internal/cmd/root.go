@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"time"
 
@@ -64,7 +65,41 @@ func init() {
 	pf.StringVar(&flagAPIKey, "api-key", "", "API key (env BB_API_KEY)")
 	pf.StringVar(&flagChain, "chain", "main", "chain segment for WhatsonChain-compatible endpoints")
 	pf.DurationVar(&flagTimeout, "timeout", 30*time.Second, "HTTP request timeout")
-	rootCmd.PersistentPreRunE = func(*cobra.Command, []string) error { return validateHost() }
+	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
+		// Offline commands (version, completion, help) contact no server, so a
+		// malformed BB_HOST/--host or --chain must not make them fail.
+		if isOfflineCmd(cmd) {
+			return nil
+		}
+		if err := validateHost(); err != nil {
+			return err
+		}
+		return validateChain()
+	}
+}
+
+// isOfflineCmd reports whether cmd runs without contacting the server, so
+// host/chain validation should be skipped for it.
+func isOfflineCmd(cmd *cobra.Command) bool {
+	for c := cmd; c != nil; c = c.Parent() {
+		switch c.Name() {
+		case "version", "completion", "help":
+			return true
+		}
+	}
+	return false
+}
+
+// chainRe restricts --chain to a single, safe path segment (no slashes or
+// traversal that could reshape the request URL).
+var chainRe = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+
+// validateChain rejects a --chain value that is not a plain path segment.
+func validateChain() error {
+	if !chainRe.MatchString(flagChain) {
+		return fmt.Errorf("invalid --chain %q (allowed: letters, digits, '.', '_', '-')", flagChain)
+	}
+	return nil
 }
 
 // validateHost fails fast with a clear message when the resolved host carries

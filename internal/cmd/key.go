@@ -96,7 +96,11 @@ Use --dry-run to fetch and inspect the challenge without paying.`,
 		fmt.Fprintf(errw, "  tier:      %s (%d days)\n", ch.Tier, ch.DurationDays)
 		fmt.Fprintf(errw, "  price:     %d sats\n", ch.AmountSats)
 		fmt.Fprintf(errw, "  pay to:    %s\n", ch.PayeeAddress)
-		fmt.Fprintf(errw, "  expires:   %s (in %s)\n", ch.ExpiresAt.Format(time.RFC3339), time.Until(ch.ExpiresAt).Round(time.Second))
+		// A zero ExpiresAt (server omitted the field) would print a bogus
+		// 0001-01-01 timestamp and a huge negative "in" duration — skip it.
+		if !ch.ExpiresAt.IsZero() {
+			fmt.Fprintf(errw, "  expires:   %s (in %s)\n", ch.ExpiresAt.Format(time.RFC3339), time.Until(ch.ExpiresAt).Round(time.Second))
+		}
 
 		if upgradeDryRun {
 			return render.JSON(cmd.OutOrStdout(), ch)
@@ -218,6 +222,12 @@ func submitProof(ctx context.Context, c *api.Client, ch *x402.Challenge, rawTx [
 	var res x402.UpgradeResult
 	if err := json.Unmarshal(raw, &res); err != nil {
 		return nil, fmt.Errorf("decoding upgrade result: %w", err)
+	}
+	// A 2xx body that unmarshals cleanly but carries no settlement data (e.g. an
+	// empty object or an error payload) must not be reported as a settled
+	// upgrade — require the fields that prove settlement.
+	if res.Tier == "" && res.Txid == "" {
+		return nil, fmt.Errorf("upgrade response contained no settlement details: %s", strings.TrimSpace(string(raw)))
 	}
 	return &res, nil
 }

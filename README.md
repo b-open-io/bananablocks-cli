@@ -131,11 +131,14 @@ funding key already available — offers to pay the challenge on the spot:
 Error: HTTP 402: rate limit exceeded
 This API key can be upgraded on-chain (x402):
   tier:    pro (30 days)
-  price:   100000 sats
+  price:   5000000 sats
   pay to:  1...
   from:    1...
-Pay 100000 sats now to upgrade to "pro"? [y/N]:
+Pay 5000000 sats now to upgrade to "pro"? [y/N]:
 ```
+
+Prices are set by the server and quoted per challenge — bb always shows the
+live price and confirms before signing.
 
 Scripts are unaffected: without a TTY (or without a funding key) it prints
 the `bb key upgrade` hint and exits non-zero as before.

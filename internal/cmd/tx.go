@@ -38,7 +38,10 @@ in it.`,
   bb tx <txid> --verify`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		txid := strings.ToLower(strings.TrimSpace(args[0]))
+		txid, err := normalizeTxID(args[0])
+		if err != nil {
+			return err
+		}
 		set := 0
 		for _, b := range []bool{txHex, txBeef, txProof} {
 			if b {

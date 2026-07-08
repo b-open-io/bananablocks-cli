@@ -250,11 +250,11 @@ func upgradeError(apiErr *api.Error) error {
 	}
 }
 
-// fundingWIF resolves the payment key from flags or environment.
-func fundingWIF() (string, error) {
-	if upgradeWIF != "" {
-		return strings.TrimSpace(upgradeWIF), nil
-	}
+// fundingWIFExplicit resolves a funding key set explicitly for this command
+// via --wif-file (preferred) or --wif. It deliberately ignores BB_WIF: an
+// inherited environment variable should not silently fund a payment. An empty
+// string with a nil error means no explicit key was given.
+func fundingWIFExplicit() (string, error) {
 	if upgradeWIFFile != "" {
 		raw, err := os.ReadFile(upgradeWIFFile)
 		if err != nil {
@@ -262,10 +262,22 @@ func fundingWIF() (string, error) {
 		}
 		return strings.TrimSpace(string(raw)), nil
 	}
+	if upgradeWIF != "" {
+		return strings.TrimSpace(upgradeWIF), nil
+	}
+	return "", nil
+}
+
+// fundingWIF resolves the payment key, preferring an explicit --wif-file/--wif
+// over the BB_WIF environment variable.
+func fundingWIF() (string, error) {
+	if w, err := fundingWIFExplicit(); err != nil || w != "" {
+		return w, err
+	}
 	if w := strings.TrimSpace(os.Getenv("BB_WIF")); w != "" {
 		return w, nil
 	}
-	return "", errors.New("a funding key is required: set --wif, --wif-file, or BB_WIF")
+	return "", errors.New("a funding key is required: set --wif-file, --wif, or BB_WIF")
 }
 
 // confirm prompts on stderr and reads a y/N answer from stdin.
@@ -303,8 +315,10 @@ func offerUpgradeOn402(errw io.Writer, err error) {
 	fmt.Fprintf(errw, "  price:   %d sats\n", ch.AmountSats)
 
 	hint := fmt.Sprintf("Run: bb key upgrade --tier %s\n", ch.Tier)
-	wif, wifErr := fundingWIF()
-	if wifErr != nil || !interactive() {
+	// Only offer to pay inline from a key set explicitly for this command; an
+	// inherited BB_WIF must not be spent from an unrelated rate-limited call.
+	wif, wifErr := fundingWIFExplicit()
+	if wifErr != nil || wif == "" || !interactive() {
 		fmt.Fprint(errw, hint)
 		return
 	}
@@ -364,8 +378,8 @@ func interactive() bool {
 func init() {
 	f := keyUpgradeCmd.Flags()
 	f.StringVar(&upgradeTier, "tier", "", "target tier (default: next tier above the key's current one)")
-	f.StringVar(&upgradeWIF, "wif", "", "funding private key (WIF); prefer --wif-file or BB_WIF")
-	f.StringVar(&upgradeWIFFile, "wif-file", "", "file containing the funding WIF")
+	f.StringVar(&upgradeWIF, "wif", "", "funding private key (WIF); less safe than --wif-file")
+	f.StringVar(&upgradeWIFFile, "wif-file", "", "file containing the funding WIF (recommended)")
 	f.BoolVar(&upgradeYes, "yes", false, "skip the payment confirmation prompt")
 	f.BoolVar(&upgradeDryRun, "dry-run", false, "fetch and print the challenge without paying")
 	f.Uint64Var(&upgradeFeeRate, "fee-rate", 1, "miner fee rate in sat/kB")

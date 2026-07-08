@@ -103,11 +103,19 @@ func (c *Client) JSON(ctx context.Context, method, path string, query url.Values
 		return err
 	}
 	defer resp.Body.Close()
-	if out == nil {
-		_, err = io.Copy(io.Discard, resp.Body)
+	// Bound the body like Bytes does: a decoder reading straight from the
+	// network lets a hostile or misconfigured host stream unbounded JSON.
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBufferedResponse+1))
+	if err != nil {
 		return err
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	if int64(len(raw)) > maxBufferedResponse {
+		return fmt.Errorf("response from %s exceeds %d bytes", path, maxBufferedResponse)
+	}
+	if out == nil {
+		return nil
+	}
+	return json.Unmarshal(raw, out)
 }
 
 // GetJSON is JSON with method GET and no body.
@@ -115,10 +123,11 @@ func (c *Client) GetJSON(ctx context.Context, path string, query url.Values, out
 	return c.JSON(ctx, http.MethodGet, path, query, "", nil, out)
 }
 
-// maxBufferedResponse caps how much of a response Bytes will hold in memory,
-// so a large or hostile host can't OOM the CLI. Content that can legitimately
-// be larger (media downloads) should use Stream instead.
-const maxBufferedResponse = 256 << 20 // 256 MiB
+// maxBufferedResponse caps how much of a response Bytes and JSON will hold in
+// memory, so a large or hostile host can't OOM the CLI. Content that can
+// legitimately be larger (media downloads) should use Stream instead. It is a
+// var only so tests can shrink it; production never reassigns it.
+var maxBufferedResponse int64 = 256 << 20 // 256 MiB
 
 // Bytes performs a GET and returns the raw body plus response headers. The body
 // is bounded by maxBufferedResponse; use Stream for arbitrarily large content.
@@ -136,7 +145,7 @@ func (c *Client) Bytes(ctx context.Context, path string, query url.Values) ([]by
 	if err != nil {
 		return nil, nil, err
 	}
-	if len(raw) > maxBufferedResponse {
+	if int64(len(raw)) > maxBufferedResponse {
 		return nil, nil, fmt.Errorf("response from %s exceeds %d bytes", path, maxBufferedResponse)
 	}
 	return raw, resp.Header, nil

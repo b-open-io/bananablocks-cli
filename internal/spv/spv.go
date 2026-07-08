@@ -151,49 +151,49 @@ func VerifyBEEF(ctx context.Context, c *api.Client, txid string, beefBytes []byt
 	subjectCovered := false
 	allValid := true
 	for i, bump := range beef.BUMPs {
-		// Pick a level-0 leaf with a hash to anchor the root computation;
-		// prefer the subject tx when this bump covers it.
-		var leaf *chainhash.Hash
+		// Verify every level-0 leaf the SDK treats as a proven transaction, not
+		// just one representative. A compound BUMP proves several txids at once;
+		// checking a single leaf's root could let a valid leaf mask another
+		// leaf whose proof does not match the header, and the subject's
+		// transitive validity may rest on exactly that other leaf.
+		var leaves []*chainhash.Hash
 		if len(bump.Path) > 0 {
 			for _, el := range bump.Path[0] {
-				if el.Hash == nil {
+				if el.Hash == nil || el.Txid == nil || !*el.Txid {
 					continue
 				}
-				if el.Hash.IsEqual(subject) {
-					leaf = el.Hash
-					break
-				}
-				if leaf == nil {
-					leaf = el.Hash
-				}
+				leaves = append(leaves, el.Hash)
 			}
 		}
-		if leaf == nil {
-			return nil, fmt.Errorf("BUMP %d has no leaf hashes", i)
-		}
-		if leaf.IsEqual(subject) {
-			subjectCovered = true
+		if len(leaves) == 0 {
+			return nil, fmt.Errorf("BUMP %d has no transaction leaves to verify", i)
 		}
 
-		root, err := bump.ComputeRoot(leaf)
-		if err != nil {
-			return nil, fmt.Errorf("computing root for BUMP %d: %w", i, err)
-		}
-
+		// One header fetch per BUMP; every leaf in it shares the same height.
 		var blk blockInfo
 		if err := c.GetJSON(ctx, "/api/v1/block/"+strconv.FormatUint(uint64(bump.BlockHeight), 10), nil, &blk); err != nil {
 			return nil, fmt.Errorf("fetching header at height %d: %w", bump.BlockHeight, err)
 		}
-		valid := blk.MerkleRoot == root.String()
-		allValid = allValid && valid
-		results = append(results, &Result{
-			Txid:         leaf.String(),
-			ComputedRoot: root.String(),
-			BlockHeight:  blk.Height,
-			BlockHash:    blk.Hash,
-			HeaderRoot:   blk.MerkleRoot,
-			Valid:        valid,
-		})
+
+		for _, leaf := range leaves {
+			if leaf.IsEqual(subject) {
+				subjectCovered = true
+			}
+			root, err := bump.ComputeRoot(leaf)
+			if err != nil {
+				return nil, fmt.Errorf("computing root for BUMP %d leaf %s: %w", i, leaf.String(), err)
+			}
+			valid := blk.MerkleRoot == root.String()
+			allValid = allValid && valid
+			results = append(results, &Result{
+				Txid:         leaf.String(),
+				ComputedRoot: root.String(),
+				BlockHeight:  blk.Height,
+				BlockHash:    blk.Hash,
+				HeaderRoot:   blk.MerkleRoot,
+				Valid:        valid,
+			})
+		}
 	}
 
 	if !subjectCovered {

@@ -3,9 +3,81 @@ package spv
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/b-open-io/bananablocks-cli/internal/api"
+	"github.com/bsv-blockchain/go-sdk/transaction"
 )
+
+// blockHeaderServer serves /api/v1/block/<height> with the given merkle root.
+func blockHeaderServer(t *testing.T, merkleRoot string) *api.Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(rw).Encode(map[string]any{
+			"hash": "0000header", "height": 814435, "merkle_root": merkleRoot,
+		})
+	}))
+	t.Cleanup(srv.Close)
+	return &api.Client{BaseURL: srv.URL, HTTP: srv.Client()}
+}
+
+// TestVerifyBEEFChecksLeafAgainstHeader verifies the proven leaf's computed
+// root is compared to the fetched block header: a matching header passes, a
+// tampered one fails. Deriving the subject/root/height from the fixture keeps
+// the assertions honest without hardcoded transcription.
+func TestVerifyBEEFChecksLeafAgainstHeader(t *testing.T) {
+	raw, err := hex.DecodeString(brc62BEEF)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beef, err := transaction.NewBeefFromBytes(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bump := beef.BUMPs[0]
+	var subject string
+	var wantRoot string
+	for _, el := range bump.Path[0] {
+		if el.Hash != nil && el.Txid != nil && *el.Txid {
+			subject = el.Hash.String()
+			root, _ := bump.ComputeRoot(el.Hash)
+			wantRoot = root.String()
+		}
+	}
+	if subject == "" {
+		t.Fatal("fixture has no txid leaf")
+	}
+
+	// Correct header → valid.
+	got, err := VerifyBEEF(context.Background(), blockHeaderServer(t, wantRoot), subject, raw)
+	if err != nil {
+		t.Fatalf("valid BEEF rejected: %v", err)
+	}
+	for _, r := range got {
+		if !r.Valid {
+			t.Fatalf("expected all results valid, got %+v", r)
+		}
+	}
+
+	// Tampered header → the leaf result is invalid.
+	got, err = VerifyBEEF(context.Background(), blockHeaderServer(t, strings.Repeat("00", 32)), subject, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	anyInvalid := false
+	for _, r := range got {
+		if !r.Valid {
+			anyInvalid = true
+		}
+	}
+	if !anyInvalid {
+		t.Fatal("tampered header root should make a leaf result invalid")
+	}
+}
 
 // A valid BRC-62 BEEF (from the go-sdk test vectors) that proves one specific
 // transaction. Verifying a *different* txid against it must fail rather than

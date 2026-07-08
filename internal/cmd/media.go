@@ -84,13 +84,13 @@ stream bytes to stdout instead.`,
 
 // parseOutpoint accepts "txid:vout".
 func parseOutpoint(s string) (string, int, error) {
-	txid, voutStr, found := strings.Cut(s, ":")
+	txidRaw, voutStr, found := strings.Cut(s, ":")
 	if !found {
 		return "", 0, fmt.Errorf("expected <txid>:<vout>, got %q", s)
 	}
-	txid = strings.ToLower(strings.TrimSpace(txid))
-	if len(txid) != 64 {
-		return "", 0, fmt.Errorf("invalid txid %q", txid)
+	txid, err := normalizeTxID(txidRaw)
+	if err != nil {
+		return "", 0, err
 	}
 	vout, err := strconv.Atoi(strings.TrimSpace(voutStr))
 	if err != nil || vout < 0 {

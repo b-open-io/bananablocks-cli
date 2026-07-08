@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -274,6 +275,73 @@ func TestSubmitPath(t *testing.T) {
 		if got := submitPath(tc.payURL, base); got != tc.want {
 			t.Errorf("submitPath(%q) = %q, want %q", tc.payURL, got, tc.want)
 		}
+	}
+}
+
+// TestFundingWIF covers key-source precedence: --wif-file beats --wif beats
+// BB_WIF, and a missing source errors mentioning all three.
+func TestFundingWIF(t *testing.T) {
+	reset := func() { upgradeWIF, upgradeWIFFile = "", "" }
+	t.Cleanup(reset)
+
+	file := filepath.Join(t.TempDir(), "f.wif")
+	if err := os.WriteFile(file, []byte("  file-wif\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// --wif-file wins over --wif.
+	reset()
+	t.Setenv("BB_WIF", "env-wif")
+	upgradeWIFFile, upgradeWIF = file, "flag-wif"
+	if got, err := fundingWIF(); err != nil || got != "file-wif" {
+		t.Fatalf("file should win: got %q, %v", got, err)
+	}
+
+	// --wif beats env.
+	reset()
+	upgradeWIF = "flag-wif"
+	if got, err := fundingWIF(); err != nil || got != "flag-wif" {
+		t.Fatalf("flag should beat env: got %q, %v", got, err)
+	}
+
+	// env as last resort.
+	reset()
+	if got, err := fundingWIF(); err != nil || got != "env-wif" {
+		t.Fatalf("env fallback: got %q, %v", got, err)
+	}
+
+	// nothing set → error naming every source.
+	reset()
+	t.Setenv("BB_WIF", "")
+	_, err := fundingWIF()
+	if err == nil || !strings.Contains(err.Error(), "--wif-file") || !strings.Contains(err.Error(), "BB_WIF") {
+		t.Fatalf("missing-source error should name all sources, got %v", err)
+	}
+
+	// fundingWIFExplicit ignores env entirely.
+	reset()
+	t.Setenv("BB_WIF", "env-wif")
+	if got, err := fundingWIFExplicit(); err != nil || got != "" {
+		t.Fatalf("explicit must ignore BB_WIF: got %q, %v", got, err)
+	}
+}
+
+// TestOfferUpgradeEnvWIFNoInline verifies an inherited BB_WIF does not trigger
+// an inline payment offer — the hint is printed instead.
+func TestOfferUpgradeEnvWIFNoInline(t *testing.T) {
+	upgradeWIF, upgradeWIFFile = "", ""
+	t.Setenv("BB_WIF", "env-wif")
+	ch := x402.Challenge{ChallengeID: "rl", Tier: "pro", DurationDays: 30, AmountSats: 5_000_000}
+	body, _ := json.Marshal(map[string]any{"error": "rate limit", "challenge": ch})
+
+	var buf bytes.Buffer
+	offerUpgradeOn402(&buf, &api.Error{Status: http.StatusPaymentRequired, Body: body})
+	out := buf.String()
+	if !strings.Contains(out, "bb key upgrade --tier pro") {
+		t.Fatalf("env-only WIF should print the hint, got %q", out)
+	}
+	if strings.Contains(out, "Pay ") {
+		t.Fatalf("env-only WIF must not prompt to pay inline, got %q", out)
 	}
 }
 

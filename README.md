@@ -111,12 +111,19 @@ payment flow:
    server broadcasts it** — `bb` never does, so nothing leaves your wallet if
    the upgrade is rejected.
 
-The funding key is a WIF private key supplied via `--wif`, `--wif-file`, or
-the `BB_WIF` environment variable:
+The funding key is a WIF private key. Prefer `--wif-file`, which keeps the key
+out of shell history and process environments:
 
 ```sh
-BB_API_KEY=bb_live_... BB_WIF=Kx... bb key upgrade --tier pro --yes
+printf '%s\n' '<funding-wif>' > ~/.config/bb/funding.wif
+chmod 600 ~/.config/bb/funding.wif
+BB_API_KEY=bb_live_... bb key upgrade --tier pro --wif-file ~/.config/bb/funding.wif --yes
 ```
+
+`--wif` and the `BB_WIF` environment variable also work for ephemeral or test
+use, but are less safe: shells, inherited environments, logs, and scrollback
+can expose the value. When more than one source is set, `--wif-file` wins,
+then `--wif`, then `BB_WIF`.
 
 You'll be shown the price, payee, and funding address and asked to confirm
 before anything is signed (skip with `--yes`).
@@ -140,8 +147,11 @@ Pay 5000000 sats now to upgrade to "pro"? [y/N]:
 Prices are set by the server and quoted per challenge — bb always shows the
 live price and confirms before signing.
 
-Scripts are unaffected: without a TTY (or without a funding key) it prints
-the `bb key upgrade` hint and exits non-zero as before.
+Scripts are unaffected: without a TTY it prints the `bb key upgrade` hint and
+exits non-zero as before. The inline offer only pays from a key set explicitly
+for that command (`--wif-file` or `--wif`); an inherited `BB_WIF` prints the
+hint instead, so an ambient funding key can't be spent from an unrelated
+command that happens to hit a rate limit.
 
 ## Development
 

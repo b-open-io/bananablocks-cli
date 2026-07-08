@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -236,13 +237,92 @@ func fundingWIF() (string, error) {
 
 // confirm prompts on stderr and reads a y/N answer from stdin.
 func confirm(cmd *cobra.Command, prompt string) bool {
-	fmt.Fprintf(cmd.ErrOrStderr(), "%s [y/N]: ", prompt)
-	line, err := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
+	return confirmIO(cmd.InOrStdin(), cmd.ErrOrStderr(), prompt)
+}
+
+func confirmIO(in io.Reader, errw io.Writer, prompt string) bool {
+	fmt.Fprintf(errw, "%s [y/N]: ", prompt)
+	line, err := bufio.NewReader(in).ReadString('\n')
 	if err != nil {
 		return false
 	}
 	answer := strings.ToLower(strings.TrimSpace(line))
 	return answer == "y" || answer == "yes"
+}
+
+// offerUpgradeOn402 runs after a command fails with a rate-limit 402 (issued
+// because the API client advertises X-Payment-Accept: x402). If the response
+// carries a challenge it prints the upgrade terms and, when the session is
+// interactive and a funding key is already at hand, offers to pay on the
+// spot; otherwise it points at `bb key upgrade`. Anonymous 402s carry no
+// challenge — the server's "get an API key" hint is already in the error.
+func offerUpgradeOn402(errw io.Writer, err error) {
+	var apiErr *api.Error
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusPaymentRequired {
+		return
+	}
+	ch, chErr := challengeFromResponse(apiErr)
+	if chErr != nil {
+		return
+	}
+	fmt.Fprintf(errw, "\nThis API key can be upgraded on-chain (x402):\n")
+	fmt.Fprintf(errw, "  tier:    %s (%d days)\n", ch.Tier, ch.DurationDays)
+	fmt.Fprintf(errw, "  price:   %d sats\n", ch.AmountSats)
+
+	hint := fmt.Sprintf("Run: bb key upgrade --tier %s\n", ch.Tier)
+	wif, wifErr := fundingWIF()
+	if wifErr != nil || !interactive() {
+		fmt.Fprint(errw, hint)
+		return
+	}
+	if payErr := payChallenge(errw, wif, ch); payErr != nil {
+		if !errors.Is(payErr, errDeclined) {
+			fmt.Fprintln(errw, "upgrade failed:", payErr)
+		}
+		fmt.Fprint(errw, hint)
+	}
+}
+
+var errDeclined = errors.New("declined")
+
+// payChallenge settles an already-issued challenge with the funding key,
+// mirroring `bb key upgrade` minus the challenge fetch.
+func payChallenge(errw io.Writer, wif string, ch *x402.Challenge) error {
+	wallet, err := x402.NewWallet(wif, !upgradeTestnet)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(errw, "  pay to:  %s\n", ch.PayeeAddress)
+	fmt.Fprintf(errw, "  from:    %s\n", wallet.Address)
+	if !confirmIO(os.Stdin, errw, fmt.Sprintf("Pay %d sats now to upgrade to %q?", ch.AmountSats, ch.Tier)) {
+		return errDeclined
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), flagTimeout)
+	defer cancel()
+	c := client()
+	tx, err := wallet.BuildPayment(ctx, c, ch, upgradeFeeRate)
+	if err != nil {
+		return err
+	}
+	res, err := submitProof(ctx, c, ch, tx.Bytes(), tx.TxID().String())
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(errw, "upgrade settled: tier %q until %s (payment txid %s) — rerun your command\n",
+		res.Tier, res.TierExpiresAt.Format(time.RFC3339), res.Txid)
+	return nil
+}
+
+// interactive reports whether both stdin and stderr are terminals, i.e. a
+// human can answer a prompt.
+func interactive() bool {
+	for _, f := range []*os.File{os.Stdin, os.Stderr} {
+		fi, err := f.Stat()
+		if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func init() {

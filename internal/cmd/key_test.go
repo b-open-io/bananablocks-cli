@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -178,6 +179,78 @@ func TestUpgradeErrorMapping(t *testing.T) {
 		if !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("status %d → %q, want it to mention %q", tc.status, err, tc.want)
 		}
+	}
+}
+
+// TestOfferUpgradeOn402 covers the rate-limit 402 → offer path: terms plus a
+// `bb key upgrade` hint when no funding key is at hand, and silence on
+// non-402 errors or challenge-less (anonymous) 402s.
+func TestOfferUpgradeOn402(t *testing.T) {
+	t.Setenv("BB_WIF", "")
+	ch := x402.Challenge{ChallengeID: "rl-1", Tier: "pro", DurationDays: 30, AmountSats: 100000}
+	body, _ := json.Marshal(map[string]any{"error": "rate limit exceeded", "challenge": ch})
+
+	var buf bytes.Buffer
+	offerUpgradeOn402(&buf, &api.Error{Status: http.StatusPaymentRequired, Body: body})
+	out := buf.String()
+	if !strings.Contains(out, "100000 sats") || !strings.Contains(out, "bb key upgrade --tier pro") {
+		t.Fatalf("offer output missing terms or hint: %q", out)
+	}
+
+	buf.Reset()
+	offerUpgradeOn402(&buf, &api.Error{Status: http.StatusTooManyRequests, Body: []byte(`{"error":"slow down"}`)})
+	if buf.Len() != 0 {
+		t.Fatalf("non-402 must not offer, got %q", buf.String())
+	}
+
+	buf.Reset()
+	offerUpgradeOn402(&buf, &api.Error{Status: http.StatusPaymentRequired, Body: []byte(`{"error":"anonymous"}`)})
+	if buf.Len() != 0 {
+		t.Fatalf("challenge-less 402 must not offer, got %q", buf.String())
+	}
+}
+
+// TestPayChallengeSettlesInline drives the rate-limit offer's inline payment
+// (confirm → build → proof submit) against the mock x402 server.
+func TestPayChallengeSettlesInline(t *testing.T) {
+	wallet, err := x402.NewWallet(testWIF, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch := &x402.Challenge{
+		Version:               x402.Version,
+		ChallengeID:           "ch-inline-1",
+		Tier:                  "pro",
+		DurationDays:          30,
+		AmountSats:            50000,
+		PayeeLockingScriptHex: "76a914000000000000000000000000000000000000000088ac",
+		PayeeAddress:          "1111111111111111111114oLvT2",
+		ExpiresAt:             time.Now().Add(15 * time.Minute).UTC(),
+		PayURL:                x402.UpgradePath,
+	}
+	srv := newX402Server(t, wallet, ch)
+	defer srv.Close()
+
+	oldHost, oldKey := flagHost, flagAPIKey
+	flagHost, flagAPIKey = srv.URL, "bb_live_test"
+	defer func() { flagHost, flagAPIKey = oldHost, oldKey }()
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.WriteString("y\n")
+	w.Close()
+	oldStdin := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = oldStdin }()
+
+	var buf bytes.Buffer
+	if err := payChallenge(&buf, testWIF, ch); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "upgrade settled") {
+		t.Fatalf("missing settle notice: %q", buf.String())
 	}
 }
 

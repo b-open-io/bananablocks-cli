@@ -12,11 +12,10 @@ commands work against any compatible host via `--host`.
 ## Install
 
 ```sh
-go install github.com/b-open-io/bananablocks-cli@latest
-# installs as "bananablocks-cli"; alias or rename it to bb if you prefer
+go install github.com/b-open-io/bananablocks-cli/cmd/bb@latest   # installs as "bb"
 ```
 
-Or build from source, which names the binary `bb`:
+Or build from source:
 
 ```sh
 make build     # → bin/bb
@@ -121,6 +120,25 @@ BB_API_KEY=bb_live_... BB_WIF=Kx... bb key upgrade --tier pro --yes
 
 You'll be shown the price, payee, and funding address and asked to confirm
 before anything is signed (skip with `--yes`).
+
+`bb` also advertises `X-Payment-Accept: x402` on every API request, so when
+a keyed command gets **rate-limited** the server answers with a payable 402
+challenge instead of a bare 429. `bb` prints the upgrade terms and either
+points you at `bb key upgrade` or — when running interactively with a
+funding key already available — offers to pay the challenge on the spot:
+
+```
+Error: HTTP 402: rate limit exceeded
+This API key can be upgraded on-chain (x402):
+  tier:    pro (30 days)
+  price:   100000 sats
+  pay to:  1...
+  from:    1...
+Pay 100000 sats now to upgrade to "pro"? [y/N]:
+```
+
+Scripts are unaffected: without a TTY (or without a funding key) it prints
+the `bb key upgrade` hint and exits non-zero as before.
 
 ## Development
 

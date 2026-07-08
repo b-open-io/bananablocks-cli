@@ -54,6 +54,10 @@ func (c *Client) NewRequest(ctx context.Context, method, path string, query url.
 	if c.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.APIKey)
 	}
+	// Advertise x402 support: the server then answers rate-limited calls with
+	// a payable 402 challenge instead of a bare 429 (only for clients that
+	// opt in, so plain callers keep the historical 429).
+	req.Header.Set("X-Payment-Accept", "x402")
 	if c.UserAgent != "" {
 		req.Header.Set("User-Agent", c.UserAgent)
 	}

@@ -46,6 +46,7 @@ func Execute() error {
 	err := rootCmd.Execute()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
+		offerUpgradeOn402(os.Stderr, err)
 	}
 	return err
 }

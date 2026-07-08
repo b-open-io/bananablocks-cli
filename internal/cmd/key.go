@@ -64,15 +64,17 @@ from the funding key's UTXOs; the signed transaction is submitted back as
 payment proof. The SERVER broadcasts the transaction — bb never does — so
 no payment leaves your wallet if the upgrade is rejected.
 
-The funding key is a WIF private key, given via --wif, --wif-file, or the
-BB_WIF environment variable. Its P2PKH address must hold enough confirmed
-satoshis to cover the challenge price plus a miner fee (~1 sat).
+The funding key is a WIF private key. Prefer --wif-file, which keeps the key
+out of shell history and inherited environments; --wif and the BB_WIF
+environment variable also work but are less safe. When more than one is set,
+--wif-file wins, then --wif, then BB_WIF. The key's P2PKH address must hold
+enough confirmed satoshis to cover the challenge price plus a miner fee.
 
 Without --tier the server picks the next tier above the key's current one.
 Use --dry-run to fetch and inspect the challenge without paying.`,
 	Example: `  bb key upgrade --dry-run
   bb key upgrade --tier pro --wif-file ~/.keys/funding.wif
-  BB_WIF=Kx... bb key upgrade --tier pro --yes`,
+  bb key upgrade --tier pro --wif-file ~/.keys/funding.wif --yes`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if apiKey() == "" {

@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/b-open-io/bananablocks-cli/internal/api"
+	"github.com/bsv-blockchain/go-sdk/chainhash"
+	"github.com/bsv-blockchain/go-sdk/script"
 	"github.com/bsv-blockchain/go-sdk/transaction"
 )
 
@@ -131,6 +133,83 @@ func TestComputeTSCRootIndexOutOfRange(t *testing.T) {
 		[]string{"b1fea52486ce0c62bb442b530a3f0132b826c74e473d1f2c220bfa78111c5082"},
 	); err == nil {
 		t.Fatal("expected an error for an index deeper than the proof")
+	}
+}
+
+// compoundBUMPBeef builds a BEEF whose single BUMP proves two txids in the
+// same block: the real subject transaction and a second arbitrary txid leaf.
+// Both leaves compute the same merkle root. Returns the BEEF bytes, the
+// subject txid, the second leaf txid, and the shared root.
+func compoundBUMPBeef(t *testing.T) (raw []byte, subject, other, root string) {
+	t.Helper()
+	subjectTx := transaction.NewTransaction()
+	subjectTx.AddOutput(&transaction.TransactionOutput{Satoshis: 1000, LockingScript: &script.Script{}})
+	a := subjectTx.TxID()
+
+	var b chainhash.Hash
+	for i := range b {
+		b[i] = 0x22
+	}
+
+	yes := true
+	mp := &transaction.MerklePath{
+		BlockHeight: 700000,
+		Path: [][]*transaction.PathElement{{
+			{Offset: 0, Hash: a, Txid: &yes},
+			{Offset: 1, Hash: &b, Txid: &yes},
+		}},
+	}
+	r, err := mp.ComputeRoot(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rb, err := mp.ComputeRoot(&b)
+	if err != nil || !rb.IsEqual(r) {
+		t.Fatalf("both leaves should share a root: %v vs %v", r, rb)
+	}
+
+	subjectTx.MerklePath = mp
+	beef := transaction.NewBeefV2()
+	if _, err := beef.MergeTransaction(subjectTx); err != nil {
+		t.Fatal(err)
+	}
+	raw, err = beef.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw, a.String(), b.String(), r.String()
+}
+
+// TestVerifyBEEFCompoundBUMP is the plan-002 regression: a BUMP with two txid
+// leaves must have BOTH verified against the header, not one representative.
+// The old one-leaf-per-BUMP code produced a single result row and could let a
+// good leaf mask a bad one; this asserts a row per leaf and that a wrong header
+// invalidates every leaf.
+func TestVerifyBEEFCompoundBUMP(t *testing.T) {
+	raw, subject, other, root := compoundBUMPBeef(t)
+
+	// Correct header → both leaves verified and valid.
+	got, err := VerifyBEEF(context.Background(), blockHeaderServer(t, root), subject, raw)
+	if err != nil {
+		t.Fatalf("compound BEEF rejected: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, r := range got {
+		seen[r.Txid] = r.Valid
+	}
+	if !seen[subject] || !seen[other] {
+		t.Fatalf("expected a verified row for BOTH leaves, got %v", seen)
+	}
+
+	// Wrong header → every leaf in the BUMP is reported invalid.
+	got, err = VerifyBEEF(context.Background(), blockHeaderServer(t, strings.Repeat("00", 32)), subject, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range got {
+		if r.Valid {
+			t.Fatalf("wrong header must invalidate every leaf, but %s is valid", r.Txid)
+		}
 	}
 }
 

@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"io"
 	"mime"
 	"net/url"
 	"os"
@@ -48,24 +49,35 @@ stream bytes to stdout instead.`,
 			return fmt.Errorf("unknown --kind %q (want media, inscription, nft, or bfile)", mediaKind)
 		}
 		path := "/api/v1/tx/" + url.PathEscape(txid) + "/" + kind + "/" + strconv.Itoa(vout)
-		raw, hdr, err := client().Bytes(cmd.Context(), path, nil)
+		// Stream the content straight to its sink; on-chain media can be large,
+		// so it is never fully buffered in memory.
+		body, hdr, err := client().Stream(cmd.Context(), path, nil)
 		if err != nil {
 			return err
 		}
+		defer body.Close()
 		contentType := hdr.Get("Content-Type")
 
 		if mediaStdout {
-			_, err := cmd.OutOrStdout().Write(raw)
+			_, err := io.Copy(cmd.OutOrStdout(), body)
 			return err
 		}
 		out := mediaOutFile
 		if out == "" {
 			out = fmt.Sprintf("%s_%d%s", txid, vout, extForContentType(contentType))
 		}
-		if err := os.WriteFile(out, raw, 0o644); err != nil {
+		f, err := os.OpenFile(out, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+		if err != nil {
 			return err
 		}
-		fmt.Fprintf(cmd.ErrOrStderr(), "wrote %d bytes (%s) to %s\n", len(raw), contentType, out)
+		n, err := io.Copy(f, body)
+		if closeErr := f.Close(); err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(cmd.ErrOrStderr(), "wrote %d bytes (%s) to %s\n", n, contentType, out)
 		return nil
 	},
 }

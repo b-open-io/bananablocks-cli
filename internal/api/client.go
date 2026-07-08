@@ -115,7 +115,13 @@ func (c *Client) GetJSON(ctx context.Context, path string, query url.Values, out
 	return c.JSON(ctx, http.MethodGet, path, query, "", nil, out)
 }
 
-// Bytes performs a GET and returns the raw body plus response headers.
+// maxBufferedResponse caps how much of a response Bytes will hold in memory,
+// so a large or hostile host can't OOM the CLI. Content that can legitimately
+// be larger (media downloads) should use Stream instead.
+const maxBufferedResponse = 256 << 20 // 256 MiB
+
+// Bytes performs a GET and returns the raw body plus response headers. The body
+// is bounded by maxBufferedResponse; use Stream for arbitrarily large content.
 func (c *Client) Bytes(ctx context.Context, path string, query url.Values) ([]byte, http.Header, error) {
 	req, err := c.NewRequest(ctx, http.MethodGet, path, query, "", nil)
 	if err != nil {
@@ -126,11 +132,29 @@ func (c *Client) Bytes(ctx context.Context, path string, query url.Values) ([]by
 		return nil, nil, err
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBufferedResponse+1))
 	if err != nil {
 		return nil, nil, err
 	}
+	if len(raw) > maxBufferedResponse {
+		return nil, nil, fmt.Errorf("response from %s exceeds %d bytes", path, maxBufferedResponse)
+	}
 	return raw, resp.Header, nil
+}
+
+// Stream performs a GET and hands back the response body for the caller to copy
+// without buffering it in memory. The caller owns and must Close the returned
+// body. Use for potentially large content such as media downloads.
+func (c *Client) Stream(ctx context.Context, path string, query url.Values) (io.ReadCloser, http.Header, error) {
+	req, err := c.NewRequest(ctx, http.MethodGet, path, query, "", nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	return resp.Body, resp.Header, nil
 }
 
 // PostJSONBody marshals v and POSTs it as application/json.

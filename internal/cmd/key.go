@@ -85,6 +85,9 @@ Use --dry-run to fetch and inspect the challenge without paying.`,
 		if err != nil {
 			return err
 		}
+		if err := ch.VerifyPayee(); err != nil {
+			return err
+		}
 
 		errw := cmd.ErrOrStderr()
 		fmt.Fprintf(errw, "x402 challenge:\n")
@@ -318,6 +321,9 @@ var errDeclined = errors.New("declined")
 // payChallenge settles an already-issued challenge with the funding key,
 // mirroring `bb key upgrade` minus the challenge fetch.
 func payChallenge(errw io.Writer, wif string, ch *x402.Challenge) error {
+	if err := ch.VerifyPayee(); err != nil {
+		return err
+	}
 	wallet, err := x402.NewWallet(wif, !upgradeTestnet)
 	if err != nil {
 		return err

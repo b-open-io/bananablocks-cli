@@ -81,18 +81,22 @@ func readTxHexArg(arg string) (string, error) {
 	default:
 		raw = []byte(arg)
 	}
-	s := strings.TrimSpace(string(raw))
+	// Collapse all ASCII whitespace so line-wrapped hex (e.g. from `xxd -p`,
+	// which wraps every 60 chars) is recognized as hex rather than mistaken
+	// for binary and double-encoded.
+	s := strings.Join(strings.Fields(string(raw)), "")
 	if s == "" {
 		return "", fmt.Errorf("%s: empty transaction payload", arg)
 	}
-	if !hexRe.MatchString(s) || len(s)%2 != 0 {
-		// A binary file is fine too — convert it to hex for the API.
-		if arg != "-" && !fileExists(arg) {
-			return "", fmt.Errorf("%q is neither valid hex nor an existing file", truncateArg(arg))
-		}
+	if hexRe.MatchString(s) && len(s)%2 == 0 {
+		return s, nil
+	}
+	// Not hex: a real file (or stdin) may hold raw binary — encode it. The
+	// original bytes are encoded, not the whitespace-stripped view.
+	if arg == "-" || fileExists(arg) {
 		return hex.EncodeToString(raw), nil
 	}
-	return s, nil
+	return "", fmt.Errorf("%q is neither valid hex nor an existing file", truncateArg(arg))
 }
 
 func truncateArg(a string) string {

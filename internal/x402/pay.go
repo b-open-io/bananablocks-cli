@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/b-open-io/bananablocks-cli/internal/api"
 	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
@@ -13,6 +14,30 @@ import (
 	feemodel "github.com/bsv-blockchain/go-sdk/transaction/fee_model"
 	"github.com/bsv-blockchain/go-sdk/transaction/template/p2pkh"
 )
+
+// VerifyPayee checks that the challenge's human-readable PayeeAddress actually
+// corresponds to PayeeLockingScriptHex — the script the payment transaction
+// will pay. Without this a challenge could display one address while the signed
+// output pays a different script, so the confirmation prompt would attest to a
+// destination the money never reaches. An empty PayeeAddress leaves nothing to
+// attest and is allowed (the script hex is then the only stated destination).
+func (c *Challenge) VerifyPayee() error {
+	if c.PayeeAddress == "" {
+		return nil
+	}
+	addr, err := script.NewAddressFromString(c.PayeeAddress)
+	if err != nil {
+		return fmt.Errorf("challenge payee address %q is invalid: %w", c.PayeeAddress, err)
+	}
+	lock, err := p2pkh.Lock(addr)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(lock.String(), c.PayeeLockingScriptHex) {
+		return fmt.Errorf("challenge payee address %s does not match the payment script the transaction would pay — refusing to sign", c.PayeeAddress)
+	}
+	return nil
+}
 
 // utxo mirrors the explorer's /api/v1/address/{addr}/utxos items.
 type utxo struct {

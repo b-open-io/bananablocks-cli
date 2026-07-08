@@ -12,8 +12,41 @@ import (
 	"time"
 
 	"github.com/b-open-io/bananablocks-cli/internal/api"
+	"github.com/bsv-blockchain/go-sdk/script"
 	"github.com/bsv-blockchain/go-sdk/transaction"
+	"github.com/bsv-blockchain/go-sdk/transaction/template/p2pkh"
 )
+
+// TestVerifyPayee is the P2 guard: the confirmation prompt's displayed address
+// must match the script the payment actually pays. A consistent challenge
+// passes; a mismatched one is refused; an empty address is allowed.
+func TestVerifyPayee(t *testing.T) {
+	addr, err := script.NewAddressFromString("1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := p2pkh.Lock(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ok := &Challenge{PayeeAddress: addr.AddressString, PayeeLockingScriptHex: lock.String()}
+	if err := ok.VerifyPayee(); err != nil {
+		t.Fatalf("consistent challenge rejected: %v", err)
+	}
+
+	// Same script, but a different address displayed to the user → refuse.
+	bad := &Challenge{PayeeAddress: "1111111111111111111114oLvT2", PayeeLockingScriptHex: lock.String()}
+	if err := bad.VerifyPayee(); err == nil {
+		t.Fatal("mismatched payee address must be refused")
+	}
+
+	// No address claimed → nothing to attest, allowed.
+	none := &Challenge{PayeeLockingScriptHex: lock.String()}
+	if err := none.VerifyPayee(); err != nil {
+		t.Fatalf("empty payee address should be allowed: %v", err)
+	}
+}
 
 func TestProofHeaderRoundTrip(t *testing.T) {
 	p := &Proof{

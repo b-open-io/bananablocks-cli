@@ -176,7 +176,7 @@ func submitProof(ctx context.Context, c *api.Client, ch *x402.Challenge, rawTx [
 	if err != nil {
 		return nil, err
 	}
-	req, err := c.NewRequest(ctx, http.MethodPost, x402.UpgradePath, nil, "", nil)
+	req, err := c.NewRequest(ctx, http.MethodPost, submitPath(ch.PayURL, c.BaseURL), nil, "", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -195,6 +195,36 @@ func submitProof(ctx context.Context, c *api.Client, ch *x402.Challenge, rawTx [
 		return nil, fmt.Errorf("decoding upgrade result: %w", err)
 	}
 	return &res, nil
+}
+
+// submitPath resolves where to POST the payment proof. The challenge's pay_url
+// takes precedence (a challenge issued off a rate-limited endpoint may name a
+// different path or carry query params), falling back to the canonical upgrade
+// path. An absolute pay_url is only honored when it targets the same host as
+// the client — the request carries the Bearer API key, so it must never be
+// sent cross-origin on the server's say-so.
+func submitPath(payURL, baseURL string) string {
+	if payURL == "" {
+		return x402.UpgradePath
+	}
+	u, err := url.Parse(payURL)
+	if err != nil {
+		return x402.UpgradePath
+	}
+	if u.IsAbs() {
+		base, err := url.Parse(baseURL)
+		if err != nil || !strings.EqualFold(u.Host, base.Host) {
+			return x402.UpgradePath
+		}
+	}
+	p := u.EscapedPath()
+	if p == "" {
+		return x402.UpgradePath
+	}
+	if u.RawQuery != "" {
+		p += "?" + u.RawQuery
+	}
+	return p
 }
 
 // upgradeError maps the server's x402 error statuses onto actionable messages.

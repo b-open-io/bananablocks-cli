@@ -7,7 +7,9 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/url"
+	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/b-open-io/bananablocks-cli/internal/api"
 	"github.com/bsv-blockchain/go-sdk/chainhash"
@@ -110,10 +112,12 @@ func VerifyTSC(ctx context.Context, c *api.Client, txid string, p *TSCProof) (*R
 }
 
 // VerifyBEEF parses BEEF bytes and verifies every BUMP's computed merkle root
-// against the block header at its height. The subject txid must be present
-// under one of the BUMPs.
+// against the block header at its height. The subject txid must be present in
+// the BEEF and provably linked — directly by a BUMP, or transitively through
+// its ancestors' inputs — to a merkle-proven transaction. Without that link a
+// server could return unrelated-but-valid proofs and pass verification.
 func VerifyBEEF(ctx context.Context, c *api.Client, txid string, beefBytes []byte) ([]*Result, error) {
-	beef, err := transaction.NewBeefFromBytes(beefBytes)
+	beef, err := parseBEEF(beefBytes)
 	if err != nil {
 		return nil, fmt.Errorf("parsing BEEF: %w", err)
 	}
@@ -126,8 +130,26 @@ func VerifyBEEF(ctx context.Context, c *api.Client, txid string, beefBytes []byt
 		return nil, fmt.Errorf("invalid txid: %w", err)
 	}
 
+	// The subject transaction must actually be in the BEEF, and its input
+	// graph must bottom out at merkle-proven transactions. ValidateTransactions
+	// resolves that linkage (a tx is valid if it has a BUMP or all its inputs
+	// trace to valid txs); we still check every BUMP's root against a header
+	// below, so both the graph and the proofs are verified.
+	if beef.FindTransaction(txid) == nil {
+		return nil, fmt.Errorf("BEEF does not contain the requested transaction %s (the server returned an unrelated set of proofs)", txid)
+	}
+	vr := beef.ValidateTransactions()
+	if !slices.Contains(vr.Valid, txid) {
+		detail := "it has no merkle-proven ancestry"
+		if len(vr.MissingInputs) > 0 {
+			detail = "these input transactions are missing from the BEEF: " + strings.Join(vr.MissingInputs, ", ")
+		}
+		return nil, fmt.Errorf("BEEF does not prove %s: %s", txid, detail)
+	}
+
 	var results []*Result
 	subjectCovered := false
+	allValid := true
 	for i, bump := range beef.BUMPs {
 		// Pick a level-0 leaf with a hash to anchor the root computation;
 		// prefer the subject tx when this bump covers it.
@@ -162,27 +184,42 @@ func VerifyBEEF(ctx context.Context, c *api.Client, txid string, beefBytes []byt
 		if err := c.GetJSON(ctx, "/api/v1/block/"+strconv.FormatUint(uint64(bump.BlockHeight), 10), nil, &blk); err != nil {
 			return nil, fmt.Errorf("fetching header at height %d: %w", bump.BlockHeight, err)
 		}
+		valid := blk.MerkleRoot == root.String()
+		allValid = allValid && valid
 		results = append(results, &Result{
 			Txid:         leaf.String(),
 			ComputedRoot: root.String(),
 			BlockHeight:  blk.Height,
 			BlockHash:    blk.Hash,
 			HeaderRoot:   blk.MerkleRoot,
-			Valid:        blk.MerkleRoot == root.String(),
+			Valid:        valid,
 		})
 	}
 
 	if !subjectCovered {
-		// The subject tx has no direct proof — it is proven transitively via
-		// its ancestors' BUMPs (standard for unconfirmed-chain BEEF). Make
-		// that visible rather than implying a direct proof was checked.
+		// No BUMP covers the subject directly; it is proven transitively via
+		// its ancestors' BUMPs (standard for unconfirmed-chain BEEF). The graph
+		// linkage was already checked above, so this is Valid only if every
+		// BUMP root also matched its header.
 		results = append(results, &Result{
 			Txid:         txid,
-			ComputedRoot: "(no direct merkle path; proven via ancestors)",
-			Valid:        true,
+			ComputedRoot: "(no direct merkle path; proven via linked ancestors)",
+			Valid:        allValid,
 		})
 	}
 	return results, nil
+}
+
+// parseBEEF wraps the SDK parser, which reads untrusted server bytes and can
+// panic (not just error) on malformed input. Recover so a hostile or buggy
+// server yields an error instead of crashing the CLI.
+func parseBEEF(beefBytes []byte) (beef *transaction.Beef, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			beef, err = nil, fmt.Errorf("malformed BEEF bytes: %v", r)
+		}
+	}()
+	return transaction.NewBeefFromBytes(beefBytes)
 }
 
 // DecodeHexOrRaw accepts either raw bytes or a hex string of them.

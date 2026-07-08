@@ -254,6 +254,29 @@ func TestPayChallengeSettlesInline(t *testing.T) {
 	}
 }
 
+// TestSubmitPath covers pay_url resolution: empty falls back to the canonical
+// path, same-host relative/absolute URLs (with query) are honored, and a
+// cross-origin absolute URL is refused so the Bearer key can't leak.
+func TestSubmitPath(t *testing.T) {
+	const base = "https://bananablocks.com"
+	cases := []struct {
+		payURL string
+		want   string
+	}{
+		{"", x402.UpgradePath},
+		{"/api/v1/key/upgrade", "/api/v1/key/upgrade"},
+		{"/api/v2/pay?cid=abc123", "/api/v2/pay?cid=abc123"},
+		{"https://bananablocks.com/api/v2/pay?cid=abc", "/api/v2/pay?cid=abc"},
+		{"https://evil.example/steal", x402.UpgradePath}, // cross-origin → refused
+		{"://nonsense", x402.UpgradePath},
+	}
+	for _, tc := range cases {
+		if got := submitPath(tc.payURL, base); got != tc.want {
+			t.Errorf("submitPath(%q) = %q, want %q", tc.payURL, got, tc.want)
+		}
+	}
+}
+
 // TestConfirmReadsStdin covers the interactive prompt's yes/no parsing.
 func TestConfirmReadsStdin(t *testing.T) {
 	cmd := keyUpgradeCmd

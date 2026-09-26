@@ -172,3 +172,76 @@ func TestKeyFingerprint(t *testing.T) {
 		t.Fatal("fingerprint must differ by host and by key")
 	}
 }
+
+// Spellings the server treats as the same host and key share a fingerprint.
+func TestKeyFingerprintCanonical(t *testing.T) {
+	const key = "bb_live_secret123"
+	base := KeyFingerprint("https://bananablocks.com", key)
+	for _, h := range []string{
+		"https://BananaBlocks.com",
+		"HTTPS://bananablocks.com",
+		"https://bananablocks.com:443",
+		"https://bananablocks.com/",
+		" https://bananablocks.com ",
+	} {
+		if KeyFingerprint(h, key) != base {
+			t.Errorf("host %q should fingerprint like https://bananablocks.com", h)
+		}
+	}
+	for _, k := range []string{" " + key, key + " ", key + "\n"} {
+		if KeyFingerprint("https://bananablocks.com", k) != base {
+			t.Errorf("key %q should fingerprint like the trimmed key", k)
+		}
+	}
+	for _, h := range []string{"http://bananablocks.com", "https://bananablocks.com:8443", "https://bananablocks.com/api"} {
+		if KeyFingerprint(h, key) == base {
+			t.Errorf("host %q is a different endpoint and must fingerprint differently", h)
+		}
+	}
+	if KeyFingerprint("http://[::1]:80", key) != KeyFingerprint("http://[::1]", key) {
+		t.Error("an IPv6 host with its default port should match the one without")
+	}
+	if KeyFingerprint("http://[::1]:8080", key) == KeyFingerprint("http://[::1]", key) {
+		t.Error("an IPv6 host with a non-default port must differ")
+	}
+	if KeyFingerprint("http://[::1]:8080", key) == KeyFingerprint("http://[::1:8080]", key) {
+		t.Error("an IPv6 host with a port must not collide with an IPv6 address that ends like that port")
+	}
+}
+
+func TestPendingStoreForChallenge(t *testing.T) {
+	s := &PendingStore{Path: filepath.Join(t.TempDir(), "pending-upgrades.json")}
+	for _, e := range []PendingUpgrade{entry("fpA", "ch1"), entry("fpB", "ch1"), entry("fpA", "ch2")} {
+		if err := s.Put(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.ForChallenge("ch1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].KeyFingerprint != "fpA" || got[1].KeyFingerprint != "fpB" {
+		t.Fatalf("ForChallenge(ch1) = %+v, want both fingerprints", got)
+	}
+	if got, _ := s.ForChallenge("nope"); len(got) != 0 {
+		t.Fatalf("ForChallenge(nope) = %+v", got)
+	}
+	if got, _ := s.ForChallenge(""); len(got) != 0 {
+		t.Fatalf("ForChallenge(\"\") = %+v, want none", got)
+	}
+}
+
+func TestPendingLastActivity(t *testing.T) {
+	e := entry("fp", "ch")
+	if !e.LastActivity().Equal(e.CreatedAt) {
+		t.Fatal("with no submit recorded, the last activity is the save time")
+	}
+	e.LastSubmitAt = e.CreatedAt.Add(time.Hour)
+	if !e.LastActivity().Equal(e.LastSubmitAt) {
+		t.Fatal("a later submit is the last activity")
+	}
+	e.LastSubmitAt = e.CreatedAt.Add(-time.Hour)
+	if !e.LastActivity().Equal(e.CreatedAt) {
+		t.Fatal("a submit time before the save time is ignored")
+	}
+}

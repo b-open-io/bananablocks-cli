@@ -155,23 +155,33 @@ from `--timeout`, which bounds each request. Ctrl-C stops the wait at once.
 Before the first submit, `bb` saves the proof to
 `<user config dir>/bb/pending-upgrades.json` (mode 0600; `~/.config/bb/` on
 Linux, `~/Library/Application Support/bb/` on macOS), keyed by a fingerprint of
-the host and API key (the key itself is not written) and the challenge id.
+the host and API key (the key itself is not written; the host's case, a
+default port, a trailing slash and whitespace around the key do not change it)
+and the challenge id.
 **If the wait runs out, the run is interrupted, or the connection drops, your
 payment is saved: rerun `bb key upgrade` and it resubmits the saved proof
 instead of building a new payment. Do not pay again.** Resuming works even
 after the challenge's `expires_at`, when the server has already moved on to a
 new challenge id; a second payment for the same challenge is not credited.
+`bb` also resumes, rather than pays, whenever the server hands out a challenge
+id that already has a saved proof, even one saved under another spelling of
+the host or key.
 While a saved proof is unsettled, the rate-limit offer below does not pay
 either; it points you at `bb key upgrade`.
 
 `bb` removes the saved entry when the upgrade settles, and when the server
 says the proof can never settle (422 rejected by broadcast, 409 payment txid
-already used, 410 expired with no payment the network holds, 400/402/404). If
-the server says **challenge already consumed**, an earlier submit most likely
-settled and its response was lost: `bb` reads the key's tier from
-`/api/v1/key/usage` and reports success when the key is at or above the
-purchased tier. Otherwise it keeps the entry and asks you to rerun, since a new
-tier can take a minute to show on every server.
+already used, 410 expired with no payment the network holds, 404 `challenge
+not found`, 400/402). Any other 404, such as a bare `404 page not found` from
+a server where the upgrade route is not enabled, keeps the entry. If the server
+says **challenge already consumed**, an earlier submit most likely settled and
+its response was lost: `bb` reads the key's tier from `/api/v1/key/usage` and
+reports success when the key is at or above the purchased tier. Otherwise, if
+the proof was last submitted less than an hour earlier, it keeps the entry and
+asks you to rerun, since a new tier can take a minute to show on every server.
+An entry last submitted longer ago (say the tier has since lapsed) can never
+settle again, so `bb` removes it and says so, and the next `bb key upgrade`
+buys a fresh upgrade.
 
 `bb` also advertises `X-Payment-Accept: x402` on every API request, so when
 a keyed command gets **rate-limited** the server answers with a payable 402

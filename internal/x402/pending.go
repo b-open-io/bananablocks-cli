@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -29,6 +31,19 @@ type PendingUpgrade struct {
 	Proof          string    `json:"proof"` // the X402-Proof header value, resubmitted verbatim
 	PayURL         string    `json:"pay_url"`
 	CreatedAt      time.Time `json:"created_at"`
+	// LastSubmitAt is when the proof was last sent to the server. A settle can
+	// only happen on a submit, so this bounds how recently it could have
+	// settled.
+	LastSubmitAt time.Time `json:"last_submit_at,omitempty"`
+}
+
+// LastActivity is the latest time the proof could have settled: its last
+// submit, or when it was saved if no submit is recorded.
+func (e PendingUpgrade) LastActivity() time.Time {
+	if e.LastSubmitAt.After(e.CreatedAt) {
+		return e.LastSubmitAt
+	}
+	return e.CreatedAt
 }
 
 type pendingFile struct {
@@ -53,10 +68,36 @@ func DefaultPendingPath() (string, error) {
 
 // KeyFingerprint derives a stable identifier for an API key on a host, so
 // saved proofs are matched to the key that paid them without writing the key
-// to disk.
+// to disk. Spellings of the same host and key that the server treats alike
+// (scheme and host case, a default port, a trailing slash, whitespace around
+// the key, which the server trims) give the same fingerprint, so a rerun with
+// a differently spelled --host or BB_API_KEY still finds the saved proof.
 func KeyFingerprint(host, apiKey string) string {
-	sum := sha256.Sum256([]byte("bb-x402-pending\x00" + host + "\x00" + apiKey))
+	sum := sha256.Sum256([]byte("bb-x402-pending\x00" + canonicalHost(host) + "\x00" + strings.TrimSpace(apiKey)))
 	return hex.EncodeToString(sum[:16])
+}
+
+// canonicalHost lowercases the scheme and host, drops the scheme's default
+// port and any trailing slash. The path keeps its case.
+func canonicalHost(h string) string {
+	h = strings.TrimRight(strings.TrimSpace(h), "/")
+	u, err := url.Parse(h)
+	if err != nil || u.Host == "" {
+		return strings.ToLower(h)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	host := strings.ToLower(u.Hostname())
+	port := u.Port()
+	if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
+		port = ""
+	}
+	if strings.Contains(host, ":") { // IPv6 literal
+		host = "[" + host + "]"
+	}
+	if port != "" {
+		host += ":" + port
+	}
+	return scheme + "://" + host + strings.TrimRight(u.EscapedPath(), "/")
 }
 
 // load returns every saved entry. A missing or empty file holds none. A file
@@ -131,6 +172,27 @@ func (s *PendingStore) ForKey(fingerprint string) ([]PendingUpgrade, error) {
 	var out []PendingUpgrade
 	for _, e := range all {
 		if e.KeyFingerprint == fingerprint {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+// ForChallenge returns the entries saved for a challenge id under any key
+// fingerprint, oldest first. The server scopes a challenge to the key it was
+// issued to, so a challenge id it serves again belongs to the same key even
+// when the fingerprint differs (e.g. the host was spelled another way).
+func (s *PendingStore) ForChallenge(challengeID string) ([]PendingUpgrade, error) {
+	if challengeID == "" {
+		return nil, nil
+	}
+	all, err := s.load()
+	if err != nil {
+		return nil, err
+	}
+	var out []PendingUpgrade
+	for _, e := range all {
+		if e.ChallengeID == challengeID {
 			out = append(out, e)
 		}
 	}

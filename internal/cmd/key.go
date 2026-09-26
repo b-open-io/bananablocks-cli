@@ -120,6 +120,22 @@ paying again, even after the challenge has expired.`,
 		if err != nil {
 			return err
 		}
+		// The server re-serves an open challenge, and a pending payment keeps
+		// its challenge open. A proof saved for this challenge id under another
+		// fingerprint (the host or key spelled differently) is still ours: the
+		// server only serves a key its own challenges. Resume it; never pay it
+		// again.
+		same, err := store.ForChallenge(ch.ChallengeID)
+		if err != nil {
+			return err
+		}
+		if len(same) > 0 {
+			if !upgradeDryRun {
+				return resumeSaved(cmd, c, store, same)
+			}
+			fmt.Fprintf(errw, "saved payment %s is for this challenge (%s) and has not settled; a run without --dry-run resubmits it instead of paying\n",
+				same[0].Txid, ch.ChallengeID)
+		}
 		if err := ch.VerifyPayee(); err != nil {
 			return err
 		}
@@ -175,7 +191,7 @@ paying again, even after the challenge has expired.`,
 	},
 }
 
-// resumeSaved resubmits the oldest saved proof for the key instead of paying
+// resumeSaved resubmits the oldest of the given saved proofs instead of paying
 // anything new. Resubmitting is valid even past the challenge's expires_at, so
 // ensureNotExpired is deliberately not consulted here.
 func resumeSaved(cmd *cobra.Command, c *api.Client, store *x402.PendingStore, saved []x402.PendingUpgrade) error {
@@ -413,6 +429,8 @@ func settleProof(ctx context.Context, c *api.Client, errw io.Writer, store *x402
 	start := nowFn()
 	deadline := start.Add(wait)
 	for {
+		prevSubmit := e.LastActivity()
+		markSubmit(errw, store, e)
 		res, pending, err := submitProof(ctx, c, e.PayURL, e.Proof)
 		if err == nil && pending == nil {
 			forgetPending(errw, store, e)
@@ -425,10 +443,10 @@ func settleProof(ctx context.Context, c *api.Client, errw io.Writer, store *x402
 			}
 			switch {
 			case isChallengeConsumed(apiErr):
-				return confirmConsumed(ctx, c, errw, store, e)
+				return confirmConsumed(ctx, c, errw, store, e, prevSubmit)
 			case apiErr.Status == http.StatusTooManyRequests:
 				pending = &pendingReply{RetryAfter: parseRetryAfter(apiErr.Header.Get("Retry-After")), Message: apiErr.Message}
-			case proofCannotSettle(apiErr.Status):
+			case proofCannotSettle(apiErr):
 				forgetPending(errw, store, e)
 				return nil, upgradeError(apiErr)
 			default:
@@ -450,6 +468,17 @@ func resumeHint(store *x402.PendingStore) string {
 	return fmt.Sprintf("your payment is saved in %s; rerun `bb key upgrade` to resume it — do not pay again", store.Path)
 }
 
+// markSubmit records on the saved entry that its proof is being sent now, so
+// a later "challenge already consumed" can tell a settle that may still be
+// propagating from a stale entry. Failing to record it is only a warning: the
+// submit itself matters more.
+func markSubmit(errw io.Writer, store *x402.PendingStore, e *x402.PendingUpgrade) {
+	e.LastSubmitAt = nowFn().UTC()
+	if err := store.Put(*e); err != nil {
+		fmt.Fprintf(errw, "warning: could not record the submit of payment %s in %s: %v\n", e.Txid, store.Path, err)
+	}
+}
+
 // forgetPending drops a resolved entry. Failing to drop it is only a warning:
 // the next run resubmits the proof, gets "challenge already consumed" (or the
 // same terminal error), and resolves it then.
@@ -463,18 +492,30 @@ func isChallengeConsumed(apiErr *api.Error) bool {
 	return apiErr.Status == http.StatusConflict && strings.Contains(apiErr.Message, "challenge already consumed")
 }
 
-// proofCannotSettle reports the statuses after which resubmitting the same
+// proofCannotSettle reports the answers after which resubmitting the same
 // proof can never succeed: malformed (400), wrong script or underpaid (402),
-// unknown challenge (404), payment txid already used or key already at the
-// tier (409, other than "challenge already consumed"), expired with no payment
-// the network holds (410), and rejected by broadcast (422).
-func proofCannotSettle(status int) bool {
-	switch status {
-	case http.StatusBadRequest, http.StatusPaymentRequired, http.StatusNotFound,
+// unknown challenge (404 "challenge not found"), payment txid already used or
+// key already at the tier (409, other than "challenge already consumed"),
+// expired with no payment the network holds (410), and rejected by broadcast
+// (422).
+//
+// A 404 counts only with the upgrade handler's own body. Any other 404 (a node
+// where the route is not mounted answers a bare "404 page not found") says
+// nothing about the proof, and dropping it there would let the next run pay
+// the challenge again.
+func proofCannotSettle(apiErr *api.Error) bool {
+	switch apiErr.Status {
+	case http.StatusNotFound:
+		return isChallengeNotFound(apiErr)
+	case http.StatusBadRequest, http.StatusPaymentRequired,
 		http.StatusConflict, http.StatusGone, http.StatusUnprocessableEntity:
 		return true
 	}
 	return false
+}
+
+func isChallengeNotFound(apiErr *api.Error) bool {
+	return apiErr.Status == http.StatusNotFound && strings.Contains(apiErr.Message, "challenge not found")
 }
 
 // keyUsage is the part of GET /api/v1/key/usage the lost-200 check reads.
@@ -483,18 +524,33 @@ type keyUsage struct {
 	TierExpiresAt *time.Time `json:"tier_expires_at"`
 }
 
+// consumedTierGrace is how long after its last earlier submit a saved proof
+// whose challenge is consumed is kept while the key's tier does not show the
+// purchase. A settle happens only on a submit, and a new tier takes about a
+// minute to reach every server, so this covers a tier read that lags a fresh
+// settle. Past it the entry can only be stale (the tier lapsed or was changed
+// since), and since a consumed challenge never takes the proof again, keeping
+// it would block every later upgrade.
+const consumedTierGrace = time.Hour
+
 // confirmConsumed handles "challenge already consumed" for a proof we saved:
 // most likely an earlier submit of it settled and its 200 was lost. The key's
-// tier decides. The entry is kept when the tier does not confirm it, because
-// other servers behind the load balancer can report the old tier for a while
-// after a settle.
-func confirmConsumed(ctx context.Context, c *api.Client, errw io.Writer, store *x402.PendingStore, e *x402.PendingUpgrade) (*x402.UpgradeResult, error) {
+// tier decides. When the tier does not confirm it, the entry is kept if an
+// earlier submit (prevSubmit, the latest time it could have settled) was
+// within consumedTierGrace, because other servers behind the load balancer can
+// report the old tier for a while after a settle; otherwise it is removed.
+func confirmConsumed(ctx context.Context, c *api.Client, errw io.Writer, store *x402.PendingStore, e *x402.PendingUpgrade, prevSubmit time.Time) (*x402.UpgradeResult, error) {
 	var u keyUsage
 	if err := c.GetJSON(ctx, "/api/v1/key/usage", nil, &u); err != nil {
 		return nil, fmt.Errorf("challenge %s is already consumed and reading the key's tier to confirm payment %s failed: %w; %s",
 			e.ChallengeID, e.Txid, err, resumeHint(store))
 	}
 	if !tierAtLeast(u.Tier, e.Tier) {
+		if age := nowFn().Sub(prevSubmit); age > consumedTierGrace {
+			forgetPending(errw, store, e)
+			return nil, fmt.Errorf("challenge %s is already consumed but the key is on tier %q, not %q; payment %s was last submitted %s ago and can never settle again, so it has been removed from %s — rerun `bb key upgrade` to buy a new upgrade",
+				e.ChallengeID, u.Tier, e.Tier, e.Txid, age.Round(time.Minute), store.Path)
+		}
 		return nil, fmt.Errorf("challenge %s is already consumed but the key is on tier %q, not %q; a new tier can take a minute to show on every server — %s",
 			e.ChallengeID, u.Tier, e.Tier, resumeHint(store))
 	}
@@ -689,6 +745,13 @@ func payChallenge(ctx context.Context, errw io.Writer, wif string, ch *x402.Chal
 	if err != nil {
 		return err
 	}
+	// A proof saved for this very challenge id belongs to this key whatever
+	// fingerprint it was saved under (the server scopes challenges to keys).
+	same, err := store.ForChallenge(ch.ChallengeID)
+	if err != nil {
+		return err
+	}
+	saved = append(saved, same...)
 	// A saved proof may already have spent coins; `bb key upgrade` resumes
 	// it. Never offer to pay again from here.
 	if len(saved) > 0 {

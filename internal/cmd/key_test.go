@@ -448,6 +448,7 @@ type proofReply struct {
 	status     int
 	retryAfter string // Retry-After header, "" = none
 	body       string // "" = a 200 settlement for the submitted txid
+	ctype      string // Content-Type, "" = application/json
 }
 
 // fakeUpgradeServer speaks the server's upgrade contract (bananablocks
@@ -517,7 +518,11 @@ func (f *fakeUpgradeServer) start() *httptest.Server {
 				})
 				return
 			}
-			rw.Header().Set("Content-Type", "application/json")
+			ctype := rep.ctype
+			if ctype == "" {
+				ctype = "application/json"
+			}
+			rw.Header().Set("Content-Type", ctype)
 			rw.WriteHeader(rep.status)
 			io.WriteString(rw, rep.body)
 		default:
@@ -613,8 +618,13 @@ func runUpgrade(t *testing.T, ctx context.Context, srvURL string, wait time.Dura
 }
 
 // seedSaved stores a pending proof for the test key on srvURL, as a previous
-// run that got a 202 would have.
+// run that got a 202 would have, saved at nowFn().
 func seedSaved(t *testing.T, store *x402.PendingStore, srvURL, challengeID, proof string) {
+	t.Helper()
+	seedSavedAt(t, store, srvURL, challengeID, proof, nowFn().UTC())
+}
+
+func seedSavedAt(t *testing.T, store *x402.PendingStore, srvURL, challengeID, proof string, created time.Time) {
 	t.Helper()
 	err := store.Put(x402.PendingUpgrade{
 		KeyFingerprint: x402.KeyFingerprint(srvURL, "bb_live_test"),
@@ -625,7 +635,7 @@ func seedSaved(t *testing.T, store *x402.PendingStore, srvURL, challengeID, proo
 		Txid:           "aa" + strings.Repeat("0", 62),
 		Proof:          proof,
 		PayURL:         x402.UpgradePath,
-		CreatedAt:      time.Now().UTC(),
+		CreatedAt:      created,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1039,6 +1049,248 @@ func TestUpgradeRetriesAfter429(t *testing.T) {
 	}
 	if !equalDurations(*slept, []time.Duration{2 * time.Second}) {
 		t.Fatalf("waits = %v", *slept)
+	}
+	if left := savedFor(t, store, srv.URL); len(left) != 0 {
+		t.Fatalf("settled payment still saved: %+v", left)
+	}
+}
+
+// --- review round 1 (OPL-5278) ---
+
+// A resubmit that lands on a node where the upgrade route is not mounted gets
+// chi's bare "404 page not found". That says nothing about the proof: the
+// entry stays and the error points at the resume. Only the upgrade handler's
+// own {"error":"challenge not found"} drops it.
+func TestUpgrade404OnlyChallengeNotFoundDropsProof(t *testing.T) {
+	cases := []struct {
+		name      string
+		reply     proofReply
+		wantErr   string
+		wantSaved bool
+	}{
+		{"bare 404", proofReply{status: http.StatusNotFound, body: "404 page not found\n", ctype: "text/plain; charset=utf-8"}, "rerun `bb key upgrade`", true},
+		{"challenge not found", proofReply{status: http.StatusNotFound, body: `{"error":"challenge not found"}`}, "challenge not found", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := useTempStore(t)
+			fakeClock(t)
+			builds := countBuilds(t)
+			f := &fakeUpgradeServer{t: t, ch: testChallenge("ch-404-1")}
+			f.setReplies(tc.reply)
+			srv := f.start()
+			seedSaved(t, store, srv.URL, "ch-404-1", "saved-proof-header")
+
+			_, _, err := runUpgrade(t, context.Background(), srv.URL, time.Minute)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("got %v, want an error mentioning %q", err, tc.wantErr)
+			}
+			if got := len(savedFor(t, store, srv.URL)); (got == 1) != tc.wantSaved {
+				t.Fatalf("saved entries after %s = %d, want saved=%v", tc.name, got, tc.wantSaved)
+			}
+			if *builds != 0 {
+				t.Fatalf("built %d payments during a resume", *builds)
+			}
+		})
+	}
+}
+
+// 409 consumed while the key's tier is below the saved entry's, long after
+// the entry was saved (the tier lapsed, or an admin changed it): the proof can
+// never settle, so the entry goes and the next run can buy a new upgrade
+// instead of being refused forever.
+func TestUpgradeConsumedStaleEntryIsDropped(t *testing.T) {
+	store := useTempStore(t)
+	fakeClock(t)
+	builds := countBuilds(t)
+	f := &fakeUpgradeServer{t: t, ch: testChallenge("ch-stale-2"), usageTier: "free"}
+	f.setReplies(proofReply{status: http.StatusConflict, body: `{"error":"challenge already consumed"}`})
+	srv := f.start()
+	seedSavedAt(t, store, srv.URL, "ch-stale-1", "saved-proof-header", nowFn().Add(-31*24*time.Hour))
+
+	_, _, err := runUpgrade(t, context.Background(), srv.URL, time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "can never settle again") {
+		t.Fatalf("a stale consumed entry should fail with an explanation, got %v", err)
+	}
+	if left := savedFor(t, store, srv.URL); len(left) != 0 {
+		t.Fatalf("a stale consumed entry must be removed, got %+v", left)
+	}
+	if *builds != 0 {
+		t.Fatalf("built %d payments while resolving a saved entry", *builds)
+	}
+
+	// The next run is no longer wedged: it fetches the open challenge and pays.
+	f.setReplies(proofReply{status: http.StatusOK})
+	if _, errOut, err := runUpgrade(t, context.Background(), srv.URL, time.Minute); err != nil {
+		t.Fatalf("the run after a dropped stale entry failed: %v\nstderr: %s", err, errOut)
+	}
+	if _, fetches := f.snapshot(); fetches != 1 {
+		t.Fatalf("want 1 challenge fetch, got %d", fetches)
+	}
+	if *builds != 1 {
+		t.Fatalf("want 1 payment built after the stale entry was dropped, got %d", *builds)
+	}
+}
+
+// Inside the one-hour grace window the entry is kept: a fresh settle can take
+// a moment to show on every server.
+func TestUpgradeConsumedYoungEntryIsKept(t *testing.T) {
+	store := useTempStore(t)
+	fakeClock(t)
+	f := &fakeUpgradeServer{t: t, ch: testChallenge("ch-young-1"), usageTier: "free"}
+	f.setReplies(proofReply{status: http.StatusConflict, body: `{"error":"challenge already consumed"}`})
+	srv := f.start()
+	seedSavedAt(t, store, srv.URL, "ch-young-1", "saved-proof-header", nowFn().Add(-59*time.Minute))
+
+	_, _, err := runUpgrade(t, context.Background(), srv.URL, time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "rerun `bb key upgrade`") {
+		t.Fatalf("a young consumed entry should ask for a rerun, got %v", err)
+	}
+	if len(savedFor(t, store, srv.URL)) != 1 {
+		t.Fatal("a young consumed entry must stay saved")
+	}
+}
+
+// The grace runs from the proof's last earlier submit, not from when it was
+// saved: a proof that stayed pending for hours and then settled on a submit
+// seconds ago (its 200 lost, the tier read lagging) must not be dropped, or
+// the user is told to pay again for a tier they just bought.
+func TestUpgradeConsumedAfterRecentSubmitIsKept(t *testing.T) {
+	store := useTempStore(t)
+	fakeClock(t)
+	builds := countBuilds(t)
+	f := &fakeUpgradeServer{t: t, ch: testChallenge("ch-late-1"), usageTier: "free"}
+	f.setReplies(
+		proofReply{status: http.StatusAccepted, retryAfter: "10", body: pendingBody},
+		proofReply{status: http.StatusConflict, body: `{"error":"challenge already consumed"}`},
+	)
+	srv := f.start()
+	seedSavedAt(t, store, srv.URL, "ch-late-1", "saved-proof-header", nowFn().Add(-3*time.Hour))
+
+	_, _, err := runUpgrade(t, context.Background(), srv.URL, time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "rerun `bb key upgrade`") {
+		t.Fatalf("consumed 10s after the previous submit should ask for a rerun, got %v", err)
+	}
+	left := savedFor(t, store, srv.URL)
+	if len(left) != 1 {
+		t.Fatal("a proof submitted seconds before the consumed answer must stay saved")
+	}
+	if !left[0].LastSubmitAt.Equal(nowFn()) {
+		t.Fatalf("LastSubmitAt = %s, want the last submit at %s", left[0].LastSubmitAt, nowFn())
+	}
+	if *builds != 0 {
+		t.Fatalf("built %d payments during a resume", *builds)
+	}
+}
+
+// localhostURL spells an httptest URL's host differently, so the key
+// fingerprint differs while the server is the same.
+func localhostURL(t *testing.T, srvURL string) string {
+	t.Helper()
+	if !strings.Contains(srvURL, "127.0.0.1") {
+		t.Skipf("httptest URL %s is not on 127.0.0.1", srvURL)
+	}
+	return strings.Replace(srvURL, "127.0.0.1", "localhost", 1)
+}
+
+// A proof saved under another spelling of the host misses the fingerprint
+// lookup, but the server re-serves the same challenge id: that match alone
+// resumes the saved proof, and no payment is built.
+func TestUpgradeResumesSavedProofByChallengeID(t *testing.T) {
+	store := useTempStore(t)
+	fakeClock(t)
+	builds := countBuilds(t)
+	f := &fakeUpgradeServer{t: t, ch: testChallenge("ch-id-1")}
+	f.setReplies(proofReply{status: http.StatusOK})
+	srv := f.start()
+	seedSaved(t, store, srv.URL, "ch-id-1", "saved-proof-header")
+	other := localhostURL(t, srv.URL)
+	if x402.KeyFingerprint(other, "bb_live_test") == x402.KeyFingerprint(srv.URL, "bb_live_test") {
+		t.Fatal("test setup: the two host spellings must fingerprint differently")
+	}
+
+	_, errOut, err := runUpgrade(t, context.Background(), other, time.Minute)
+	if err != nil {
+		t.Fatalf("resume failed: %v\nstderr: %s", err, errOut)
+	}
+	if *builds != 0 {
+		t.Fatalf("built %d payments for a challenge that already has a saved proof", *builds)
+	}
+	if proofs, _ := f.snapshot(); len(proofs) != 1 || proofs[0] != "saved-proof-header" {
+		t.Fatalf("want the saved proof resubmitted once, got %q", proofs)
+	}
+	if left := savedFor(t, store, srv.URL); len(left) != 0 {
+		t.Fatalf("settled payment still saved: %+v", left)
+	}
+}
+
+// The rate-limit offer refuses to pay a challenge that has a saved proof,
+// whatever fingerprint it was saved under.
+func TestPayChallengeRefusesSavedChallengeID(t *testing.T) {
+	store := useTempStore(t)
+	builds := countBuilds(t)
+	f := &fakeUpgradeServer{t: t, ch: testChallenge("ch-offer-id-1")}
+	f.setReplies(proofReply{status: http.StatusOK})
+	srv := f.start()
+	seedSaved(t, store, srv.URL, "ch-offer-id-1", "saved-proof-header")
+	oldHost, oldKey := flagHost, flagAPIKey
+	flagHost, flagAPIKey = localhostURL(t, srv.URL), "bb_live_test"
+	t.Cleanup(func() { flagHost, flagAPIKey = oldHost, oldKey })
+
+	var buf bytes.Buffer
+	err := payChallenge(context.Background(), &buf, testWIF, f.ch)
+	if err == nil || !strings.Contains(err.Error(), "bb key upgrade") {
+		t.Fatalf("want a pointer to `bb key upgrade`, got %v", err)
+	}
+	if strings.Contains(buf.String(), "Pay ") || *builds != 0 {
+		t.Fatalf("must not prompt or build while the challenge has a saved proof (builds=%d, out=%q)", *builds, buf.String())
+	}
+}
+
+// The inline offer builds under --timeout but waits out 202s under --wait:
+// the resubmit loop must not inherit the --timeout deadline.
+func TestPayChallengeSettleNotBoundByTimeout(t *testing.T) {
+	store := useTempStore(t)
+	fakeClock(t)
+	oldSleep := sleepCtx
+	deadlines := 0
+	sleepCtx = func(ctx context.Context, d time.Duration) error {
+		if _, ok := ctx.Deadline(); ok {
+			deadlines++
+		}
+		return oldSleep(ctx, d)
+	}
+	t.Cleanup(func() { sleepCtx = oldSleep })
+	f := &fakeUpgradeServer{t: t, ch: testChallenge("ch-inline-t")}
+	f.setReplies(
+		proofReply{status: http.StatusAccepted, retryAfter: "10", body: pendingBody},
+		proofReply{status: http.StatusAccepted, retryAfter: "10", body: pendingBody},
+		proofReply{status: http.StatusOK},
+	)
+	srv := f.start()
+	oldHost, oldKey, oldTimeout, oldWait := flagHost, flagAPIKey, flagTimeout, upgradeWait
+	flagHost, flagAPIKey, flagTimeout, upgradeWait = srv.URL, "bb_live_test", 5*time.Second, 10*time.Minute
+	t.Cleanup(func() { flagHost, flagAPIKey, flagTimeout, upgradeWait = oldHost, oldKey, oldTimeout, oldWait })
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.WriteString("y\n")
+	w.Close()
+	oldStdin := os.Stdin
+	os.Stdin = r
+	t.Cleanup(func() { os.Stdin = oldStdin })
+
+	var buf bytes.Buffer
+	if err := payChallenge(context.Background(), &buf, testWIF, f.ch); err != nil {
+		t.Fatalf("inline payment failed: %v\n%s", err, buf.String())
+	}
+	if deadlines != 0 {
+		t.Fatalf("%d pending waits ran under a deadline; the settle loop must be bounded by --wait, not --timeout", deadlines)
+	}
+	if proofs, _ := f.snapshot(); len(proofs) != 3 {
+		t.Fatalf("want 3 submits, got %d", len(proofs))
 	}
 	if left := savedFor(t, store, srv.URL); len(left) != 0 {
 		t.Fatalf("settled payment still saved: %+v", left)

@@ -105,6 +105,7 @@ bb media <txid>:<vout> --stdout | jq .       # stream to stdout
 bb key usage                       # tier, rate limit, today's usage
 bb key upgrade --dry-run           # fetch the 402 challenge, don't pay
 bb key upgrade --tier pro          # buy a tier upgrade on-chain
+bb key upgrade                     # resume a saved pending payment (never pays twice)
 ```
 
 `bb key upgrade` implements the x402 (BRC-120-style, scheme `bsv-tx-v1`)
@@ -134,6 +135,43 @@ then `--wif`, then `BB_WIF`.
 
 You'll be shown the price, payee, and funding address and asked to confirm
 before anything is signed (skip with `--yes`).
+
+#### Pending payments and resuming
+
+The server can answer the proof with **202 Accepted** and a `Retry-After`
+header: it broadcast your payment, but the network has not accepted it yet.
+A 202 grants nothing, and the challenge stays open. `bb` waits `Retry-After`
+seconds (10 if the header is missing or unreadable, clamped to 1–60) and
+resubmits the **same** proof until the server answers 200, printing one line
+per pending answer to stderr:
+
+```
+payment 3f2a… not settled yet (payment broadcast but not yet accepted by the network; resubmit the same proof); resubmitting the same proof in 10s
+```
+
+`--wait` (default `10m`) caps how long `bb` keeps doing that. It is separate
+from `--timeout`, which bounds each request. Ctrl-C stops the wait at once.
+
+Before the first submit, `bb` saves the proof to
+`<user config dir>/bb/pending-upgrades.json` (mode 0600; `~/.config/bb/` on
+Linux, `~/Library/Application Support/bb/` on macOS), keyed by a fingerprint of
+the host and API key (the key itself is not written) and the challenge id.
+**If the wait runs out, the run is interrupted, or the connection drops, your
+payment is saved: rerun `bb key upgrade` and it resubmits the saved proof
+instead of building a new payment. Do not pay again.** Resuming works even
+after the challenge's `expires_at`, when the server has already moved on to a
+new challenge id; a second payment for the same challenge is not credited.
+While a saved proof is unsettled, the rate-limit offer below does not pay
+either; it points you at `bb key upgrade`.
+
+`bb` removes the saved entry when the upgrade settles, and when the server
+says the proof can never settle (422 rejected by broadcast, 409 payment txid
+already used, 410 expired with no payment the network holds, 400/402/404). If
+the server says **challenge already consumed**, an earlier submit most likely
+settled and its response was lost: `bb` reads the key's tier from
+`/api/v1/key/usage` and reports success when the key is at or above the
+purchased tier. Otherwise it keeps the entry and asks you to rerun, since a new
+tier can take a minute to show on every server.
 
 `bb` also advertises `X-Payment-Accept: x402` on every API request, so when
 a keyed command gets **rate-limited** the server answers with a payable 402

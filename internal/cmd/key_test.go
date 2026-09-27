@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -803,8 +804,11 @@ func TestUpgradePendingBudgetThenResume(t *testing.T) {
 }
 
 // The spec's rerun case: the server re-serves the SAME (now expired)
-// challenge id. The saved proof is resubmitted, no payment is built, and the
-// expiry does not block it.
+// challenge id. The saved proof is resubmitted and no payment is built. The
+// proof is found by key fingerprint, which resumes before any challenge is
+// fetched, so this test cannot see ensureNotExpired;
+// TestUpgradeResumesSavedProofByChallengeID covers the expiry on the path
+// that fetches the challenge first.
 func TestUpgradeResumesSavedProofForSameChallenge(t *testing.T) {
 	store := useTempStore(t)
 	fakeClock(t)
@@ -1325,12 +1329,17 @@ func localhostURL(t *testing.T, srvURL string) string {
 
 // A proof saved under another spelling of the host misses the fingerprint
 // lookup, but the server re-serves the same challenge id: that match alone
-// resumes the saved proof, and no payment is built.
+// resumes the saved proof, and no payment is built. The challenge is past
+// expires_at: a pending payment keeps it open, so the expiry guard (which only
+// protects building a NEW payment) must not block the resume.
 func TestUpgradeResumesSavedProofByChallengeID(t *testing.T) {
 	store := useTempStore(t)
 	fakeClock(t)
 	builds := countBuilds(t)
-	f := &fakeUpgradeServer{t: t, ch: testChallenge("ch-id-1")}
+	ch := testChallenge("ch-id-1")
+	// time.Now, not nowFn: ensureNotExpired reads the real clock.
+	ch.ExpiresAt = time.Now().Add(-time.Minute).UTC()
+	f := &fakeUpgradeServer{t: t, ch: ch}
 	f.setReplies(proofReply{status: http.StatusOK})
 	srv := f.start()
 	seedSaved(t, store, srv.URL, "ch-id-1", "saved-proof-header")
@@ -1628,5 +1637,42 @@ func TestUpgradeLostResponseSubmitStaysRecorded(t *testing.T) {
 				t.Fatalf("built %d payments during a resume", *builds)
 			}
 		})
+	}
+}
+
+// --wait defaults to the spec's 10m budget.
+func TestUpgradeWaitFlagDefault(t *testing.T) {
+	fl := keyUpgradeCmd.Flags().Lookup("wait")
+	if fl == nil {
+		t.Fatal("bb key upgrade has no --wait flag")
+	}
+	if fl.DefValue != "10m0s" {
+		t.Fatalf("--wait default = %s, want 10m0s", fl.DefValue)
+	}
+}
+
+// A negative --wait is rejected before any request or payment build.
+func TestUpgradeRejectsNegativeWait(t *testing.T) {
+	useTempStore(t)
+	builds := countBuilds(t)
+	var hits atomic.Int64
+	f := &fakeUpgradeServer{t: t, ch: testChallenge("ch-neg-wait-1")}
+	f.setReplies(proofReply{status: http.StatusOK})
+	inner := f.start()
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		inner.Config.Handler.ServeHTTP(rw, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	_, _, err := runUpgrade(t, context.Background(), srv.URL, -time.Second)
+	if err == nil || !strings.Contains(err.Error(), "--wait must not be negative") {
+		t.Fatalf("want a negative --wait rejected, got %v", err)
+	}
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("sent %d requests despite a negative --wait", n)
+	}
+	if *builds != 0 {
+		t.Fatalf("built %d payments despite a negative --wait", *builds)
 	}
 }

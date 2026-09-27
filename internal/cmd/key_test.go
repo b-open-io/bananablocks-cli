@@ -599,6 +599,12 @@ func countBuilds(t *testing.T) *int {
 // against srvURL and returns stdout, stderr and the error.
 func runUpgrade(t *testing.T, ctx context.Context, srvURL string, wait time.Duration) (string, string, error) {
 	t.Helper()
+	return runUpgradeMode(t, ctx, srvURL, wait, false)
+}
+
+// runUpgradeMode is runUpgrade with --dry-run set to dryRun.
+func runUpgradeMode(t *testing.T, ctx context.Context, srvURL string, wait time.Duration, dryRun bool) (string, string, error) {
+	t.Helper()
 	oldHost, oldKey := flagHost, flagAPIKey
 	oldTier, oldWIF, oldWIFFile, oldYes, oldDry, oldWait := upgradeTier, upgradeWIF, upgradeWIFFile, upgradeYes, upgradeDryRun, upgradeWait
 	t.Cleanup(func() {
@@ -606,7 +612,7 @@ func runUpgrade(t *testing.T, ctx context.Context, srvURL string, wait time.Dura
 		upgradeTier, upgradeWIF, upgradeWIFFile, upgradeYes, upgradeDryRun, upgradeWait = oldTier, oldWIF, oldWIFFile, oldYes, oldDry, oldWait
 	})
 	flagHost, flagAPIKey = srvURL, "bb_live_test"
-	upgradeTier, upgradeWIF, upgradeWIFFile, upgradeYes, upgradeDryRun, upgradeWait = "pro", testWIF, "", true, false, wait
+	upgradeTier, upgradeWIF, upgradeWIFFile, upgradeYes, upgradeDryRun, upgradeWait = "pro", testWIF, "", true, dryRun, wait
 
 	var out, errb bytes.Buffer
 	cmd := keyUpgradeCmd
@@ -871,6 +877,8 @@ func TestUpgradeTerminalAndTransientAnswers(t *testing.T) {
 	}{
 		{"422 rejected", proofReply{status: http.StatusUnprocessableEntity, body: `{"error":"transaction rejected by broadcast"}`}, "rejected", false},
 		{"409 txid used", proofReply{status: http.StatusConflict, body: `{"error":"payment txid already used"}`}, "txid already used", false},
+		{"400 malformed", proofReply{status: http.StatusBadRequest, body: `{"error":"malformed payment proof"}`}, "malformed", false},
+		{"402 insufficient", proofReply{status: http.StatusPaymentRequired, body: `{"error":"payment insufficient"}`}, "insufficient", false},
 		{"410 expired", proofReply{status: http.StatusGone, body: `{"error":"challenge expired; request a new one"}`}, "expired", false},
 		{"500", proofReply{status: http.StatusInternalServerError, body: `{"error":"upgrade failed"}`}, "rerun `bb key upgrade`", true},
 		{"200 without settlement", proofReply{status: http.StatusOK, body: `{}`}, "no settlement details", true},
@@ -1175,11 +1183,100 @@ func TestUpgradeConsumedAfterRecentSubmitIsKept(t *testing.T) {
 	if len(left) != 1 {
 		t.Fatal("a proof submitted seconds before the consumed answer must stay saved")
 	}
-	if !left[0].LastSubmitAt.Equal(nowFn()) {
-		t.Fatalf("LastSubmitAt = %s, want the last submit at %s", left[0].LastSubmitAt, nowFn())
+	// The consumed-answered submit settled nothing, so the recorded submit is
+	// the 202 one, 10s (one Retry-After) earlier.
+	if want := nowFn().Add(-10 * time.Second); !left[0].LastSubmitAt.Equal(want) {
+		t.Fatalf("LastSubmitAt = %s, want the 202 submit at %s", left[0].LastSubmitAt, want)
 	}
 	if *builds != 0 {
 		t.Fatalf("built %d payments during a resume", *builds)
+	}
+}
+
+// Rerunning as the keep path asks must not extend the grace: a submit that
+// got "challenge already consumed" settled nothing, so it is not recorded, and
+// once the last real submit is over an hour old the entry is dropped instead
+// of wedging every upgrade for as long as the user keeps rerunning.
+func TestUpgradeConsumedRerunDoesNotExtendGrace(t *testing.T) {
+	store := useTempStore(t)
+	fakeClock(t)
+	builds := countBuilds(t)
+	f := &fakeUpgradeServer{t: t, ch: testChallenge("ch-rerun-1"), usageTier: "free"}
+	f.setReplies(proofReply{status: http.StatusConflict, body: `{"error":"challenge already consumed"}`})
+	srv := f.start()
+	seedSavedAt(t, store, srv.URL, "ch-rerun-1", "saved-proof-header", nowFn().Add(-50*time.Minute))
+
+	_, _, err := runUpgrade(t, context.Background(), srv.URL, time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "rerun `bb key upgrade`") {
+		t.Fatalf("first run, 50m after the save, should keep the entry, got %v", err)
+	}
+	left := savedFor(t, store, srv.URL)
+	if len(left) != 1 {
+		t.Fatal("first run must keep the entry inside the grace")
+	}
+	if !left[0].LastSubmitAt.IsZero() {
+		t.Fatalf("a consumed-answered submit was recorded: LastSubmitAt = %s", left[0].LastSubmitAt)
+	}
+
+	if err := sleepCtx(context.Background(), 30*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = runUpgrade(t, context.Background(), srv.URL, time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "can never settle again") {
+		t.Fatalf("rerun 80m after the last real submit should drop the entry, got %v", err)
+	}
+	if left := savedFor(t, store, srv.URL); len(left) != 0 {
+		t.Fatalf("entry still saved after the grace ran out: %+v", left)
+	}
+	if proofs, _ := f.snapshot(); len(proofs) != 2 {
+		t.Fatalf("want one submit per run, got %d", len(proofs))
+	}
+	if *builds != 0 {
+		t.Fatalf("built %d payments while resolving a saved entry", *builds)
+	}
+}
+
+// --dry-run never resumes a saved proof: it only fetches and prints the
+// challenge, whether the entry is found by key fingerprint or, under another
+// spelling of the host, by challenge id.
+func TestUpgradeDryRunDoesNotResumeSaved(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		runAt func(t *testing.T, srvURL string) string
+	}{
+		{"same fingerprint", func(_ *testing.T, u string) string { return u }},
+		{"same challenge id", localhostURL},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := useTempStore(t)
+			fakeClock(t)
+			builds := countBuilds(t)
+			f := &fakeUpgradeServer{t: t, ch: testChallenge("ch-dry-1")}
+			f.setReplies(proofReply{status: http.StatusOK})
+			srv := f.start()
+			seedSaved(t, store, srv.URL, "ch-dry-1", "saved-proof-header")
+
+			out, errOut, err := runUpgradeMode(t, context.Background(), tc.runAt(t, srv.URL), time.Minute, true)
+			if err != nil {
+				t.Fatalf("dry run failed: %v\nstderr: %s", err, errOut)
+			}
+			if proofs, _ := f.snapshot(); len(proofs) != 0 {
+				t.Fatalf("--dry-run submitted %d proofs", len(proofs))
+			}
+			if *builds != 0 {
+				t.Fatalf("--dry-run built %d payments", *builds)
+			}
+			if len(savedFor(t, store, srv.URL)) != 1 {
+				t.Fatal("--dry-run must leave the saved proof in place")
+			}
+			if !strings.Contains(errOut, "has not settled") {
+				t.Fatalf("--dry-run should mention the saved payment, stderr: %s", errOut)
+			}
+			var ch x402.Challenge
+			if err := json.Unmarshal([]byte(out), &ch); err != nil || ch.ChallengeID != "ch-dry-1" {
+				t.Fatalf("stdout should be the challenge JSON, got %q (err %v)", out, err)
+			}
+		})
 	}
 }
 

@@ -429,7 +429,7 @@ func settleProof(ctx context.Context, c *api.Client, errw io.Writer, store *x402
 	start := nowFn()
 	deadline := start.Add(wait)
 	for {
-		prevSubmit := e.LastActivity()
+		prevLast, prevSubmit := e.LastSubmitAt, e.LastActivity()
 		markSubmit(errw, store, e)
 		res, pending, err := submitProof(ctx, c, e.PayURL, e.Proof)
 		if err == nil && pending == nil {
@@ -443,6 +443,11 @@ func settleProof(ctx context.Context, c *api.Client, errw io.Writer, store *x402
 			}
 			switch {
 			case isChallengeConsumed(apiErr):
+				// The server answers "consumed" without settling anything, so
+				// this submit cannot have settled the challenge. Un-record it:
+				// left in place, every rerun the keep path asks for would
+				// restart consumedTierGrace and the entry would never go.
+				unmarkSubmit(errw, store, e, prevLast)
 				return confirmConsumed(ctx, c, errw, store, e, prevSubmit)
 			case apiErr.Status == http.StatusTooManyRequests:
 				pending = &pendingReply{RetryAfter: parseRetryAfter(apiErr.Header.Get("Retry-After")), Message: apiErr.Message}
@@ -476,6 +481,16 @@ func markSubmit(errw io.Writer, store *x402.PendingStore, e *x402.PendingUpgrade
 	e.LastSubmitAt = nowFn().UTC()
 	if err := store.Put(*e); err != nil {
 		fmt.Fprintf(errw, "warning: could not record the submit of payment %s in %s: %v\n", e.Txid, store.Path, err)
+	}
+}
+
+// unmarkSubmit restores the LastSubmitAt a submit that provably settled
+// nothing overwrote. Failing to restore it is only a warning: the entry then
+// waits one more consumedTierGrace before it can be dropped.
+func unmarkSubmit(errw io.Writer, store *x402.PendingStore, e *x402.PendingUpgrade, prev time.Time) {
+	e.LastSubmitAt = prev
+	if err := store.Put(*e); err != nil {
+		fmt.Fprintf(errw, "warning: could not restore the last submit time of payment %s in %s: %v\n", e.Txid, store.Path, err)
 	}
 }
 

@@ -179,6 +179,8 @@ its response was lost: `bb` reads the key's tier from `/api/v1/key/usage` and
 reports success when the key is at or above the purchased tier. Otherwise, if
 the proof was last submitted less than an hour earlier, it keeps the entry and
 asks you to rerun, since a new tier can take a minute to show on every server.
+A submit answered **challenge already consumed** settled nothing, so it does
+not count as a submit and rerunning does not restart that hour.
 An entry last submitted longer ago (say the tier has since lapsed) can never
 settle again, so `bb` removes it and says so, and the next `bb key upgrade`
 buys a fresh upgrade.

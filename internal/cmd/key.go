@@ -473,6 +473,13 @@ func settleProof(ctx context.Context, c *api.Client, errw io.Writer, store *x402
 				unmarkSubmit(errw, store, e, prevLast)
 				return confirmConsumed(ctx, c, errw, store, e, prevSubmit)
 			case apiErr.Status == http.StatusTooManyRequests:
+				// The server's upgrade limiter answers 429 before it reads
+				// the proof (and a rate limiter in front of the handler
+				// never reaches it), so this submit settled nothing either.
+				// Un-record it, or a following "challenge already consumed"
+				// would judge a long-settled entry by this attempt's time
+				// and report it as this run's upgrade.
+				unmarkSubmit(errw, store, e, prevLast)
 				pending = &pendingReply{RetryAfter: parseRetryAfter(apiErr.Header.Get("Retry-After")), Message: apiErr.Message}
 			case apiErr.Status >= http.StatusInternalServerError:
 				// A node draining or restarting behind the load balancer, or

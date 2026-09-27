@@ -1474,6 +1474,48 @@ func TestUpgradeConsumedStaleAtTierIsNotThisRunsSettlement(t *testing.T) {
 	}
 }
 
+// A 429 is sent before the server reads the proof, so it settled nothing and
+// must not move the entry's last submit time: a following "challenge already
+// consumed" still sees a 25-day-old entry and refuses to report it as this
+// run's upgrade.
+func TestUpgradeRateLimitedResubmitDoesNotRefreshStaleEntry(t *testing.T) {
+	store := useTempStore(t)
+	slept := fakeClock(t)
+	builds := countBuilds(t)
+	f := &fakeUpgradeServer{t: t, ch: testChallenge("ch-new-1"), usageTier: "pro"}
+	f.setReplies(
+		proofReply{status: http.StatusTooManyRequests, retryAfter: "1", body: `{"error":"payment request limit exceeded"}`},
+		proofReply{status: http.StatusConflict, body: `{"error":"challenge already consumed"}`},
+	)
+	srv := f.start()
+	seedSavedAt(t, store, srv.URL, "ch-old", "saved-proof-header", nowFn().Add(-25*24*time.Hour))
+
+	out, errOut, err := runUpgrade(t, context.Background(), srv.URL, time.Minute)
+	if err == nil {
+		t.Fatalf("a 429 then consumed on a 25-day-old entry must not be reported as this run's upgrade\nstdout: %s\nstderr: %s", out, errOut)
+	}
+	for _, want := range []string{"settled earlier", "bought nothing"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q should mention %q", err, want)
+		}
+	}
+	if out != "" {
+		t.Fatalf("stdout must carry no settlement, got %q", out)
+	}
+	if strings.Contains(errOut, "upgrade settled") {
+		t.Fatalf("stderr reports the old payment as settled by this run: %q", errOut)
+	}
+	if left := savedFor(t, store, srv.URL); len(left) != 0 {
+		t.Fatalf("the long-settled entry must be removed, got %+v", left)
+	}
+	if proofs, fetches := f.snapshot(); len(proofs) != 2 || fetches != 0 || *builds != 0 {
+		t.Fatalf("want 2 resubmits, 0 challenge fetches, 0 builds; got %d, %d, %d", len(proofs), fetches, *builds)
+	}
+	if len(*slept) != 1 || (*slept)[0] != time.Second {
+		t.Fatalf("want one 1s wait for the 429's Retry-After, got %v", *slept)
+	}
+}
+
 // A submit that fails in transit (the connection drops before the answer, or
 // in the middle of a 200's body) is resubmitted with the identical proof
 // within the same run, under --wait.

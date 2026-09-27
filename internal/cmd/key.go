@@ -75,7 +75,8 @@ Use --dry-run to fetch and inspect the challenge without paying.
 The server can answer a submitted proof with 202 (pending): it broadcast the
 payment but the network has not accepted it yet. That grants nothing. bb then
 resubmits the SAME proof every Retry-After seconds until it settles, for up to
---wait (default 10m; --timeout still bounds each request). The proof is saved
+--wait (default 10m; --timeout still bounds each request). A 429, a 5xx or a
+dropped connection is waited out and resubmitted the same way. The proof is saved
 to <user config dir>/bb/pending-upgrades.json (mode 0600) before the first
 submit. If it is still pending when --wait runs out, or the run is
 interrupted, rerun bb key upgrade: it resubmits the saved proof instead of
@@ -376,9 +377,19 @@ func parseRetryAfter(v string) time.Duration {
 	return time.Duration(n) * time.Second
 }
 
+// transientSubmitError is a proof submit that failed in transit: the
+// connection dropped, the per-request timeout fired, or the response body
+// could not be read. The server may or may not have acted on it, and
+// resubmitting the same proof is safe either way.
+type transientSubmitError struct{ err error }
+
+func (e *transientSubmitError) Error() string { return e.err.Error() }
+func (e *transientSubmitError) Unwrap() error { return e.err }
+
 // submitProof POSTs one proof submit. It returns the settlement on 200, a
 // pendingReply on 202, and otherwise the error (an *api.Error for non-2xx
-// statuses, left for settleProof to classify).
+// statuses, a *transientSubmitError for a failure in transit, left for
+// settleProof to classify).
 func submitProof(ctx context.Context, c *api.Client, payURL, proofHdr string) (*x402.UpgradeResult, *pendingReply, error) {
 	req, err := c.NewRequest(ctx, http.MethodPost, submitPath(payURL, c.BaseURL), nil, "", nil)
 	if err != nil {
@@ -387,14 +398,18 @@ func submitProof(ctx context.Context, c *api.Client, payURL, proofHdr string) (*
 	req.Header.Set("X402-Proof", proofHdr)
 	resp, err := c.Do(req)
 	if err != nil {
-		return nil, nil, err
+		var apiErr *api.Error
+		if errors.As(err, &apiErr) {
+			return nil, nil, err
+		}
+		return nil, nil, &transientSubmitError{err}
 	}
 	defer resp.Body.Close()
 	// Bound the body like the client's JSON/Bytes paths do, rather than decoding
 	// straight from an unbounded network stream.
 	raw, err := c.ReadBody(resp.Body)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, &transientSubmitError{err}
 	}
 	if resp.StatusCode == http.StatusAccepted {
 		var body struct {
@@ -419,12 +434,13 @@ func submitProof(ctx context.Context, c *api.Client, payURL, proofHdr string) (*
 	return &res, nil, nil
 }
 
-// settleProof submits a saved proof and, while the server answers 202,
-// resubmits the identical proof after each Retry-After until it settles, a
-// terminal answer arrives, ctx ends, or the next wait would overrun the wait
-// budget. Every attempt is bounded by the client's per-request timeout on its
-// own. The saved entry is removed only when the proof has settled or can no
-// longer settle; on every other exit it stays for the next run to resume.
+// settleProof submits a saved proof and, while the server answers 202 (or
+// 429, a 5xx, or the submit fails in transit), resubmits the identical proof
+// after each Retry-After until it settles, a terminal answer arrives, ctx
+// ends, or the next wait would overrun the wait budget. Every attempt is
+// bounded by the client's per-request timeout on its own. The saved entry is
+// removed only when the proof has settled or can no longer settle; on every
+// other exit it stays for the next run to resume.
 func settleProof(ctx context.Context, c *api.Client, errw io.Writer, store *x402.PendingStore, e *x402.PendingUpgrade, wait time.Duration) (*x402.UpgradeResult, error) {
 	start := nowFn()
 	deadline := start.Add(wait)
@@ -438,10 +454,17 @@ func settleProof(ctx context.Context, c *api.Client, errw io.Writer, store *x402
 		}
 		if err != nil {
 			var apiErr *api.Error
-			if !errors.As(err, &apiErr) {
-				return nil, fmt.Errorf("submitting payment %s: %w; %s", e.Txid, err, resumeHint(store))
-			}
+			var transient *transientSubmitError
 			switch {
+			case errors.As(err, &transient) && ctx.Err() == nil:
+				// A dropped connection or a per-request timeout, not Ctrl-C.
+				// The submit may have settled with its response lost;
+				// resubmitting the same proof is safe either way, and a later
+				// "challenge already consumed" is judged from this submit's
+				// time.
+				pending = &pendingReply{RetryAfter: defaultPendingRetry, Message: err.Error()}
+			case !errors.As(err, &apiErr):
+				return nil, fmt.Errorf("submitting payment %s: %w; %s", e.Txid, err, resumeHint(store))
 			case isChallengeConsumed(apiErr):
 				// The server answers "consumed" without settling anything, so
 				// this submit cannot have settled the challenge. Un-record it:
@@ -451,6 +474,11 @@ func settleProof(ctx context.Context, c *api.Client, errw io.Writer, store *x402
 				return confirmConsumed(ctx, c, errw, store, e, prevSubmit)
 			case apiErr.Status == http.StatusTooManyRequests:
 				pending = &pendingReply{RetryAfter: parseRetryAfter(apiErr.Header.Get("Retry-After")), Message: apiErr.Message}
+			case apiErr.Status >= http.StatusInternalServerError:
+				// A node draining or restarting behind the load balancer, or
+				// the server failing to read the payment's network status.
+				// Neither says anything about the proof: wait and resubmit it.
+				pending = &pendingReply{RetryAfter: parseRetryAfter(apiErr.Header.Get("Retry-After")), Message: apiErr.Error()}
 			case proofCannotSettle(apiErr):
 				forgetPending(errw, store, e)
 				return nil, upgradeError(apiErr)
@@ -550,24 +578,43 @@ const consumedTierGrace = time.Hour
 
 // confirmConsumed handles "challenge already consumed" for a proof we saved:
 // most likely an earlier submit of it settled and its 200 was lost. The key's
-// tier decides. When the tier does not confirm it, the entry is kept if an
-// earlier submit (prevSubmit, the latest time it could have settled) was
-// within consumedTierGrace, because other servers behind the load balancer can
-// report the old tier for a while after a settle; otherwise it is removed.
+// tier and the time of the proof's last earlier submit (prevSubmit, the latest
+// time it could have settled) decide. At or above the tier with a submit
+// within consumedTierGrace, that submit settled: report success. Below the
+// tier within the grace, keep the entry, because other servers behind the load
+// balancer can report the old tier for a while after a settle. Past the grace
+// the entry is removed either way, and the run fails: a settle that old is not
+// this run's result.
 func confirmConsumed(ctx context.Context, c *api.Client, errw io.Writer, store *x402.PendingStore, e *x402.PendingUpgrade, prevSubmit time.Time) (*x402.UpgradeResult, error) {
 	var u keyUsage
 	if err := c.GetJSON(ctx, "/api/v1/key/usage", nil, &u); err != nil {
 		return nil, fmt.Errorf("challenge %s is already consumed and reading the key's tier to confirm payment %s failed: %w; %s",
 			e.ChallengeID, e.Txid, err, resumeHint(store))
 	}
+	age := nowFn().Sub(prevSubmit)
 	if !tierAtLeast(u.Tier, e.Tier) {
-		if age := nowFn().Sub(prevSubmit); age > consumedTierGrace {
+		if age > consumedTierGrace {
 			forgetPending(errw, store, e)
 			return nil, fmt.Errorf("challenge %s is already consumed but the key is on tier %q, not %q; payment %s was last submitted %s ago and can never settle again, so it has been removed from %s — rerun `bb key upgrade` to buy a new upgrade",
 				e.ChallengeID, u.Tier, e.Tier, e.Txid, age.Round(time.Minute), store.Path)
 		}
 		return nil, fmt.Errorf("challenge %s is already consumed but the key is on tier %q, not %q; a new tier can take a minute to show on every server — %s",
 			e.ChallengeID, u.Tier, e.Tier, resumeHint(store))
+	}
+	if age > consumedTierGrace {
+		// The key has the tier, but no submit of this proof in the last
+		// consumedTierGrace can have settled it: it settled long ago and the
+		// entry outlived its lost 200. Reporting that old payment as this
+		// run's settlement would let a renewal exit 0 having bought nothing,
+		// so drop the entry and fail instead. Nothing is bought here either: a
+		// rerun meant only to resume must not pay again.
+		forgetPending(errw, store, e)
+		until := ""
+		if u.TierExpiresAt != nil {
+			until = " until " + u.TierExpiresAt.Format(time.RFC3339)
+		}
+		return nil, fmt.Errorf("saved payment %s for challenge %s settled earlier (last submitted %s ago; the key is on tier %q%s) and has been removed from %s; this run bought nothing — rerun `bb key upgrade` if you meant to buy or renew a tier",
+			e.Txid, e.ChallengeID, age.Round(time.Minute), u.Tier, until, store.Path)
 	}
 	fmt.Fprintf(errw, "challenge %s was already settled and the key is on tier %q: an earlier submit of payment %s went through\n",
 		e.ChallengeID, u.Tier, e.Txid)

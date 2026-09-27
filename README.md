@@ -149,6 +149,11 @@ per pending answer to stderr:
 payment 3f2a… not settled yet (payment broadcast but not yet accepted by the network; resubmit the same proof); resubmitting the same proof in 10s
 ```
 
+`bb` treats a 429, a 5xx (a node draining or restarting behind the load
+balancer, say) and a submit that fails in transit (the connection drops or
+`--timeout` fires) the same way: it waits (`Retry-After` when sent, else 10
+seconds) and resubmits the same proof.
+
 `--wait` (default `10m`) caps how long `bb` keeps doing that. It is separate
 from `--timeout`, which bounds each request. Ctrl-C stops the wait at once.
 
@@ -176,14 +181,17 @@ not found`, 400/402). Any other 404, such as a bare `404 page not found` from
 a server where the upgrade route is not enabled, keeps the entry. If the server
 says **challenge already consumed**, an earlier submit most likely settled and
 its response was lost: `bb` reads the key's tier from `/api/v1/key/usage` and
-reports success when the key is at or above the purchased tier. Otherwise, if
-the proof was last submitted less than an hour earlier, it keeps the entry and
-asks you to rerun, since a new tier can take a minute to show on every server.
+reports success when the key is at or above the purchased tier and the proof
+was last submitted less than an hour earlier. Below that tier within the hour,
+it keeps the entry and asks you to rerun, since a new tier can take a minute to
+show on every server.
 A submit answered **challenge already consumed** settled nothing, so it does
 not count as a submit and rerunning does not restart that hour.
-An entry last submitted longer ago (say the tier has since lapsed) can never
-settle again, so `bb` removes it and says so, and the next `bb key upgrade`
-buys a fresh upgrade.
+An entry last submitted longer ago can never settle again, so `bb` removes it
+and exits non-zero whatever the tier: below it (say the tier has since lapsed)
+the payment is gone, and at or above it the payment settled long ago, so it is
+not reported as this run's upgrade. Either way this run buys nothing, and the
+next `bb key upgrade` buys a fresh upgrade or renewal.
 
 `bb` also advertises `X-Payment-Accept: x402` on every API request, so when
 a keyed command gets **rate-limited** the server answers with a payable 402

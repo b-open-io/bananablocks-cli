@@ -449,6 +449,8 @@ type proofReply struct {
 	retryAfter string // Retry-After header, "" = none
 	body       string // "" = a 200 settlement for the submitted txid
 	ctype      string // Content-Type, "" = application/json
+	hangup     bool   // close the connection without answering
+	truncate   bool   // start a 200 and drop the connection mid-body
 }
 
 // fakeUpgradeServer speaks the server's upgrade contract (bananablocks
@@ -508,6 +510,22 @@ func (f *fakeUpgradeServer) start() *httptest.Server {
 				i = len(f.replies) - 1
 			}
 			rep := f.replies[i]
+			if rep.hangup {
+				conn, _, err := rw.(http.Hijacker).Hijack()
+				if err != nil {
+					f.t.Errorf("hijacking the proof submit: %v", err)
+					return
+				}
+				conn.Close()
+				return
+			}
+			if rep.truncate {
+				rw.Header().Set("Content-Length", "1000")
+				rw.WriteHeader(http.StatusOK)
+				io.WriteString(rw, `{"tier":`)
+				rw.(http.Flusher).Flush()
+				panic(http.ErrAbortHandler) // the server drops the connection; the deferred Unlock still runs
+			}
 			if rep.retryAfter != "" {
 				rw.Header().Set("Retry-After", rep.retryAfter)
 			}
@@ -870,18 +888,23 @@ func TestUpgradeConsumedChecksTier(t *testing.T) {
 // keep it for a rerun.
 func TestUpgradeTerminalAndTransientAnswers(t *testing.T) {
 	cases := []struct {
-		name      string
-		reply     proofReply
-		wantErr   string
-		wantSaved bool
+		name        string
+		reply       proofReply
+		wantErr     string
+		wantSaved   bool
+		wantSubmits int // 0 = exactly 1
 	}{
-		{"422 rejected", proofReply{status: http.StatusUnprocessableEntity, body: `{"error":"transaction rejected by broadcast"}`}, "rejected", false},
-		{"409 txid used", proofReply{status: http.StatusConflict, body: `{"error":"payment txid already used"}`}, "txid already used", false},
-		{"400 malformed", proofReply{status: http.StatusBadRequest, body: `{"error":"malformed payment proof"}`}, "malformed", false},
-		{"402 insufficient", proofReply{status: http.StatusPaymentRequired, body: `{"error":"payment insufficient"}`}, "insufficient", false},
-		{"410 expired", proofReply{status: http.StatusGone, body: `{"error":"challenge expired; request a new one"}`}, "expired", false},
-		{"500", proofReply{status: http.StatusInternalServerError, body: `{"error":"upgrade failed"}`}, "rerun `bb key upgrade`", true},
-		{"200 without settlement", proofReply{status: http.StatusOK, body: `{}`}, "no settlement details", true},
+		{"422 rejected", proofReply{status: http.StatusUnprocessableEntity, body: `{"error":"transaction rejected by broadcast"}`}, "rejected", false, 0},
+		{"409 txid used", proofReply{status: http.StatusConflict, body: `{"error":"payment txid already used"}`}, "txid already used", false, 0},
+		{"400 malformed", proofReply{status: http.StatusBadRequest, body: `{"error":"malformed payment proof"}`}, "malformed", false, 0},
+		{"402 insufficient", proofReply{status: http.StatusPaymentRequired, body: `{"error":"payment insufficient"}`}, "insufficient", false, 0},
+		{"410 expired", proofReply{status: http.StatusGone, body: `{"error":"challenge expired; request a new one"}`}, "expired", false, 0},
+		// A 5xx says nothing about the proof: it is resubmitted every 10s
+		// (no Retry-After) for the whole 1m --wait, at 0s, 10s, ... 60s.
+		{"500", proofReply{status: http.StatusInternalServerError, body: `{"error":"upgrade failed"}`}, "rerun `bb key upgrade`", true, 7},
+		{"502 from the LB", proofReply{status: http.StatusBadGateway, body: "<html>502 Bad Gateway</html>", ctype: "text/html"}, "rerun `bb key upgrade`", true, 7},
+		{"503 Retry-After", proofReply{status: http.StatusServiceUnavailable, retryAfter: "30", body: `{"error":"draining"}`}, "rerun `bb key upgrade`", true, 3},
+		{"200 without settlement", proofReply{status: http.StatusOK, body: `{}`}, "no settlement details", true, 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -898,8 +921,18 @@ func TestUpgradeTerminalAndTransientAnswers(t *testing.T) {
 			if got := len(savedFor(t, store, srv.URL)) == 1; got != tc.wantSaved {
 				t.Fatalf("saved after %s = %v, want %v", tc.name, got, tc.wantSaved)
 			}
-			if proofs, _ := f.snapshot(); len(proofs) != 1 {
-				t.Fatalf("a non-pending answer must not be resubmitted, got %d submits", len(proofs))
+			want := tc.wantSubmits
+			if want == 0 {
+				want = 1
+			}
+			proofs, _ := f.snapshot()
+			if len(proofs) != want {
+				t.Fatalf("want %d submits after %s, got %d", want, tc.name, len(proofs))
+			}
+			for _, p := range proofs[1:] {
+				if p != proofs[0] {
+					t.Fatal("a resubmit carried a different X402-Proof; it must resend the identical proof")
+				}
 			}
 		})
 	}
@@ -1391,5 +1424,167 @@ func TestPayChallengeSettleNotBoundByTimeout(t *testing.T) {
 	}
 	if left := savedFor(t, store, srv.URL); len(left) != 0 {
 		t.Fatalf("settled payment still saved: %+v", left)
+	}
+}
+
+// --- review round 3 (OPL-5278) ---
+
+// A saved entry whose last submit is long past, answered "challenge already
+// consumed" while the key already holds the tier (a lost 200 from weeks ago,
+// then a renewal run): that old settle is not this run's result. The run
+// fails, reports nothing on stdout, buys nothing, and drops the entry.
+func TestUpgradeConsumedStaleAtTierIsNotThisRunsSettlement(t *testing.T) {
+	store := useTempStore(t)
+	fakeClock(t)
+	builds := countBuilds(t)
+	f := &fakeUpgradeServer{t: t, ch: testChallenge("ch-new-1"), usageTier: "pro"}
+	f.setReplies(proofReply{status: http.StatusConflict, body: `{"error":"challenge already consumed"}`})
+	srv := f.start()
+	seedSavedAt(t, store, srv.URL, "ch-old", "saved-proof-header", nowFn().Add(-25*24*time.Hour))
+
+	out, errOut, err := runUpgrade(t, context.Background(), srv.URL, time.Minute)
+	if err == nil {
+		t.Fatalf("a settle from 25 days ago must not be reported as this run's upgrade\nstdout: %s\nstderr: %s", out, errOut)
+	}
+	for _, want := range []string{"settled earlier", "bought nothing", "rerun `bb key upgrade`"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q should mention %q", err, want)
+		}
+	}
+	if out != "" {
+		t.Fatalf("stdout must carry no settlement, got %q", out)
+	}
+	if strings.Contains(errOut, "upgrade settled") {
+		t.Fatalf("stderr reports the old payment as settled by this run: %q", errOut)
+	}
+	if left := savedFor(t, store, srv.URL); len(left) != 0 {
+		t.Fatalf("the long-settled entry must be removed, got %+v", left)
+	}
+	if proofs, fetches := f.snapshot(); len(proofs) != 1 || fetches != 0 || *builds != 0 {
+		t.Fatalf("want 1 resubmit, 0 challenge fetches, 0 builds; got %d, %d, %d", len(proofs), fetches, *builds)
+	}
+
+	// The entry no longer takes over: the next run buys the renewal.
+	f.setReplies(proofReply{status: http.StatusOK})
+	if _, errOut, err := runUpgrade(t, context.Background(), srv.URL, time.Minute); err != nil {
+		t.Fatalf("the run after the stale entry was dropped failed: %v\nstderr: %s", err, errOut)
+	}
+	if _, fetches := f.snapshot(); fetches != 1 || *builds != 1 {
+		t.Fatalf("want 1 challenge fetch and 1 build for the renewal, got %d and %d", fetches, *builds)
+	}
+}
+
+// A submit that fails in transit (the connection drops before the answer, or
+// in the middle of a 200's body) is resubmitted with the identical proof
+// within the same run, under --wait.
+func TestUpgradeRetriesAfterDroppedConnection(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		first proofReply
+	}{
+		{"before the answer", proofReply{hangup: true}},
+		{"mid-body", proofReply{truncate: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) { testRetryAfterTransportError(t, tc.first) })
+	}
+}
+
+func testRetryAfterTransportError(t *testing.T, first proofReply) {
+	store := useTempStore(t)
+	slept := fakeClock(t)
+	builds := countBuilds(t)
+	f := &fakeUpgradeServer{t: t, ch: testChallenge("ch-drop-1")}
+	f.setReplies(first, proofReply{status: http.StatusOK})
+	srv := f.start()
+
+	out, errOut, err := runUpgrade(t, context.Background(), srv.URL, time.Minute)
+	if err != nil {
+		t.Fatalf("upgrade failed: %v\nstderr: %s", err, errOut)
+	}
+	proofs, _ := f.snapshot()
+	if len(proofs) != 2 || proofs[0] != proofs[1] {
+		t.Fatalf("want the same proof submitted twice, got %d", len(proofs))
+	}
+	if !equalDurations(*slept, []time.Duration{defaultPendingRetry}) {
+		t.Fatalf("waits = %v", *slept)
+	}
+	if *builds != 1 {
+		t.Fatalf("built %d payments, want 1", *builds)
+	}
+	if !strings.Contains(out, `"tier": "pro"`) {
+		t.Fatalf("stdout lacks the settlement: %q", out)
+	}
+	if left := savedFor(t, store, srv.URL); len(left) != 0 {
+		t.Fatalf("settled payment still saved: %+v", left)
+	}
+}
+
+// Ctrl-C during a submit that fails in transit stops at once rather than
+// retrying.
+func TestUpgradeTransientErrorAfterCancelStops(t *testing.T) {
+	store := useTempStore(t)
+	fakeClock(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	f := &fakeUpgradeServer{t: t, ch: testChallenge("ch-drop-2")}
+	f.setReplies(proofReply{hangup: true})
+	f.onProof = func(string) { cancel() }
+	srv := f.start()
+
+	_, errOut, err := runUpgrade(t, ctx, srv.URL, 10*time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "rerun `bb key upgrade`") {
+		t.Fatalf("cancel should stop with a resume hint, got %v", err)
+	}
+	if strings.Contains(errOut, "resubmitting") {
+		t.Fatalf("a cancelled run must not announce a resubmit: %q", errOut)
+	}
+	if proofs, _ := f.snapshot(); len(proofs) != 1 {
+		t.Fatalf("a cancelled run must not resubmit, got %d submits", len(proofs))
+	}
+	if len(savedFor(t, store, srv.URL)) != 1 {
+		t.Fatal("a cancelled payment must stay saved")
+	}
+}
+
+// Only a "challenge already consumed" answer un-records its submit. A submit
+// whose response was lost may have settled, so it stays recorded: a consumed
+// answer to the next resubmit is then judged from it, not from the entry's
+// save hours ago, and the entry is kept rather than dropped as stale (which
+// would tell the user to pay again for a tier just bought).
+func TestUpgradeLostResponseSubmitStaysRecorded(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		lost proofReply
+	}{
+		{"dropped connection", proofReply{hangup: true}},
+		{"500", proofReply{status: http.StatusInternalServerError, body: `{"error":"upgrade failed"}`}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := useTempStore(t)
+			fakeClock(t)
+			builds := countBuilds(t)
+			f := &fakeUpgradeServer{t: t, ch: testChallenge("ch-lost-1"), usageTier: "free"}
+			f.setReplies(tc.lost, proofReply{status: http.StatusConflict, body: `{"error":"challenge already consumed"}`})
+			srv := f.start()
+			seedSavedAt(t, store, srv.URL, "ch-lost-1", "saved-proof-header", nowFn().Add(-3*time.Hour))
+			lostAt := nowFn()
+
+			_, _, err := runUpgrade(t, context.Background(), srv.URL, time.Minute)
+			if err == nil || !strings.Contains(err.Error(), "rerun `bb key upgrade`") {
+				t.Fatalf("consumed right after a lost submit should ask for a rerun, got %v", err)
+			}
+			left := savedFor(t, store, srv.URL)
+			if len(left) != 1 {
+				t.Fatal("a proof whose last submit may have just settled must stay saved")
+			}
+			if !left[0].LastSubmitAt.Equal(lostAt) {
+				t.Fatalf("LastSubmitAt = %s, want the lost submit at %s", left[0].LastSubmitAt, lostAt)
+			}
+			if proofs, _ := f.snapshot(); len(proofs) != 2 {
+				t.Fatalf("want 2 submits, got %d", len(proofs))
+			}
+			if *builds != 0 {
+				t.Fatalf("built %d payments during a resume", *builds)
+			}
+		})
 	}
 }

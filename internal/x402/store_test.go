@@ -8,7 +8,7 @@ import (
 )
 
 func TestStoreSaveRefusesSecondPaymentForChallenge(t *testing.T) {
-	s := NewProofStore(t.TempDir(), "https://h", "k")
+	s := NewProofStore(t.TempDir(), "k")
 	a := &SavedProof{ChallengeID: "c", Txid: "aa", ProofHeader: "h1", SavedAt: time.Now()}
 	if err := s.Save(a); err != nil {
 		t.Fatal(err)
@@ -28,7 +28,7 @@ func TestStoreSaveRefusesSecondPaymentForChallenge(t *testing.T) {
 }
 
 func TestStoreArchiveOnlyMatchingTxid(t *testing.T) {
-	s := NewProofStore(t.TempDir(), "https://h", "k")
+	s := NewProofStore(t.TempDir(), "k")
 	if err := s.Save(&SavedProof{ChallengeID: "c", Txid: "aa", ProofHeader: "h"}); err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +47,7 @@ func TestStoreArchiveOnlyMatchingTxid(t *testing.T) {
 }
 
 func TestStoreLockExclusive(t *testing.T) {
-	s := NewProofStore(t.TempDir(), "https://h", "k")
+	s := NewProofStore(t.TempDir(), "k")
 	unlock, err := s.Lock()
 	if err != nil {
 		t.Fatal(err)
@@ -65,28 +65,33 @@ func TestStoreLockExclusive(t *testing.T) {
 
 func TestStoreKeySpellingsShareScope(t *testing.T) {
 	dir := t.TempDir()
-	a := NewProofStore(dir, "https://H.example/", " bb_live_x\n")
-	for _, h := range []string{"https://h.example", "https://h.example:443", "HTTPS://h.example.:443/api"} {
-		b := NewProofStore(dir, h, "bb_live_x")
-		if a.Dir != b.Dir {
-			t.Fatalf("%q must share the store of https://H.example/", h)
-		}
+	if NewProofStore(dir, " bb_live_x\n").Dir != NewProofStore(dir, "bb_live_x").Dir {
+		t.Fatal("equivalent key spellings must share a store")
 	}
-	for _, pair := range [][2]string{
+	if NewProofStore(dir, "bb_live_y").Dir == NewProofStore(dir, "bb_live_x").Dir {
+		t.Fatal("different keys must not share a store")
+	}
+}
+
+func TestCanonicalOrigin(t *testing.T) {
+	same := [][2]string{
+		{"https://H.example/", "https://h.example:443"},
+		{"https://h.example", "HTTPS://h.example.:443/api"},
 		{"http://127.0.0.1:8080", "http://127.0.0.1:08080"},
 		{"http://[2001:db8::1]:80", "http://[2001:0db8:0000:0000:0000:0000:0000:0001]"},
-	} {
-		if NewProofStore(dir, pair[0], "k").Dir != NewProofStore(dir, pair[1], "k").Dir {
-			t.Fatalf("%q and %q must share a store", pair[0], pair[1])
+	}
+	for _, p := range same {
+		if CanonicalOrigin(p[0]) != CanonicalOrigin(p[1]) {
+			t.Errorf("%q and %q should match", p[0], p[1])
 		}
 	}
-	if NewProofStore(dir, "https://h.example:8443", "bb_live_x").Dir == a.Dir {
-		t.Fatal("a non-default port is a different server")
+	if CanonicalOrigin("https://h.example:8443") == CanonicalOrigin("https://h.example") {
+		t.Error("a non-default port is a different server")
 	}
 }
 
 func TestStorePaidWithGlobMetacharactersInPath(t *testing.T) {
-	s := NewProofStore(filepath.Join(t.TempDir(), "bb[prod]*?"), "https://h", "k")
+	s := NewProofStore(filepath.Join(t.TempDir(), "bb[prod]*?"), "k")
 	if err := s.Save(&SavedProof{ChallengeID: "c", Txid: "aa", ProofHeader: "h"}); err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +107,7 @@ func TestStorePaidFailsClosedOnUnreadableArchive(t *testing.T) {
 	if os.Getuid() == 0 {
 		t.Skip("root ignores directory permissions")
 	}
-	s := NewProofStore(t.TempDir(), "https://h", "k")
+	s := NewProofStore(t.TempDir(), "k")
 	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
 		t.Fatal(err)
 	}

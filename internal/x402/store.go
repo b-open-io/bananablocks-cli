@@ -37,8 +37,10 @@ type SavedProof struct {
 	ArchiveReason string    `json:"archive_reason,omitempty"`
 }
 
-// ProofStore keeps SavedProofs on disk in a directory scoped to a
-// (host, API key) pair; the key itself is never written, only a hash of it.
+// ProofStore keeps SavedProofs on disk in a directory scoped to the API key
+// alone (a hash of it; the key is never written). Scoping by key rather than
+// by host means no spelling of a server URL can reach a different store or
+// lock; a proof is only ever resubmitted to the origin it was saved for.
 // Pending proofs sit at the top level, one per challenge. A proof that
 // settles, can never settle, or is abandoned moves to archive/, which also
 // remembers every challenge that has ever been paid so none is paid twice.
@@ -60,18 +62,19 @@ func DefaultStateDir() (string, error) {
 	return filepath.Join(base, "bananablocks-cli"), nil
 }
 
-// NewProofStore returns the store for host + apiKey under stateDir.
-func NewProofStore(stateDir, host, apiKey string) *ProofStore {
-	// The server trims the key before authenticating it, so equivalent
-	// spellings must share one store (and one lock).
-	sum := sha256.Sum256([]byte(canonicalOrigin(host) + "\x00" + strings.TrimSpace(apiKey)))
+// NewProofStore returns the store for apiKey under stateDir. The server
+// trims the key before authenticating it, so equivalent spellings share one
+// store (and one lock).
+func NewProofStore(stateDir, apiKey string) *ProofStore {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(apiKey)))
 	return &ProofStore{Dir: filepath.Join(stateDir, "x402-proofs", hex.EncodeToString(sum[:12]))}
 }
 
-// canonicalOrigin reduces a host URL to scheme://host[:port] in lower case,
-// dropping a default port and any path, so every spelling of one server
-// shares one store and one lock.
-func canonicalOrigin(raw string) string {
+// CanonicalOrigin reduces a host URL to scheme://host[:port] in lower case,
+// dropping a default port and any path. It decides whether a saved proof
+// belongs to the server a run targets; a spelling it fails to unify makes
+// bb refuse to resubmit (fail closed), never pay again.
+func CanonicalOrigin(raw string) string {
 	raw = strings.TrimSpace(raw)
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" {

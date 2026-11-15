@@ -100,13 +100,17 @@ func proofStore() (*x402.ProofStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("locating a state directory for payment proofs (set BB_STATE_DIR): %w", err)
 	}
-	return x402.NewProofStore(dir, host(), apiKey()), nil
+	return x402.NewProofStore(dir, apiKey()), nil
 }
 
 // settleProof submits sp's proof until the server settles it, gives a
 // terminal answer, or the wait budget runs out. A proof that may still settle
 // stays saved; one that never can is removed.
 func settleProof(ctx context.Context, c *api.Client, errw io.Writer, store *x402.ProofStore, sp *x402.SavedProof, wait time.Duration) (*x402.UpgradeResult, error) {
+	if sp.Host != "" && x402.CanonicalOrigin(sp.Host) != x402.CanonicalOrigin(c.BaseURL) {
+		return nil, fmt.Errorf("the saved proof for payment %s (challenge %s) belongs to %s, not %s; rerun with --host %s to resubmit it. Do NOT pay again",
+			sp.Txid, sp.ChallengeID, sp.Host, c.BaseURL, sp.Host)
+	}
 	deadline := time.Now().Add(wait)
 	rejected := 0
 	for {

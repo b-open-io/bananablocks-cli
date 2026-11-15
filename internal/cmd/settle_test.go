@@ -69,7 +69,7 @@ func noSleep(t *testing.T) *[]time.Duration {
 func savedFixture(t *testing.T, srvURL string) (*api.Client, *x402.ProofStore, *x402.SavedProof) {
 	t.Helper()
 	c := &api.Client{BaseURL: srvURL, APIKey: "bb_live_test", HTTP: http.DefaultClient}
-	store := x402.NewProofStore(t.TempDir(), srvURL, "bb_live_test")
+	store := x402.NewProofStore(t.TempDir(), "bb_live_test")
 	ch := &x402.Challenge{ChallengeID: "ch-1", Tier: "pro", AmountSats: 5000, ExpiresAt: time.Now().Add(10 * time.Minute), PayURL: x402.UpgradePath}
 	sp, err := newSavedProof(c, ch, []byte{1, 2, 3}, strings.Repeat("ab", 32))
 	if err != nil {
@@ -349,5 +349,24 @@ func TestUpgradeIsExclusive(t *testing.T) {
 	err = payChallenge(context.Background(), io.Discard, testWIF, &x402.Challenge{ChallengeID: "x", ExpiresAt: time.Now().Add(time.Minute)})
 	if !errors.Is(err, x402.ErrLocked) {
 		t.Fatalf("want ErrLocked, got %v", err)
+	}
+}
+
+// TestSettleProofRefusesOtherHost: a proof saved for one server is never sent
+// to another; the run fails closed and keeps the proof.
+func TestSettleProofRefusesOtherHost(t *testing.T) {
+	noSleep(t)
+	s := newScriptedProofServer(t)
+	_, store, sp := savedFixture(t, "https://bananablocks.com")
+	c := &api.Client{BaseURL: s.srv.URL, HTTP: http.DefaultClient}
+	_, err := settleProof(context.Background(), c, io.Discard, store, sp, time.Hour)
+	if err == nil || !strings.Contains(err.Error(), "--host https://bananablocks.com") {
+		t.Fatalf("got %v", err)
+	}
+	if len(s.proofs) != 0 {
+		t.Fatal("proof was sent to a different host")
+	}
+	if left, _ := store.List(); len(left) != 1 {
+		t.Fatal("proof must stay pending")
 	}
 }

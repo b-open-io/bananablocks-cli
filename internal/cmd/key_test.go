@@ -136,7 +136,7 @@ func TestUpgradeFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	store := x402.NewProofStore(t.TempDir(), srv.URL, "bb_live_test")
+	store := x402.NewProofStore(t.TempDir(), "bb_live_test")
 	sp, err := newSavedProof(c, got, tx.Bytes(), tx.TxID().String())
 	if err != nil {
 		t.Fatal(err)

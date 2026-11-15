@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/b-open-io/bananablocks-cli/internal/api"
 	"github.com/b-open-io/bananablocks-cli/internal/render"
 	"github.com/b-open-io/bananablocks-cli/internal/spv"
 	"github.com/spf13/cobra"
@@ -16,10 +17,12 @@ import (
 
 var (
 	txHex     bool
+	txBin     bool
 	txBeef    bool
 	txProof   bool
 	txVerify  bool
 	txOutFile string
+	txTarget  string
 
 	flagHeadersURL   string
 	flagHeadersToken string
@@ -29,8 +32,10 @@ var (
 var txCmd = &cobra.Command{
 	Use:   "tx <txid>",
 	Short: "Show a transaction; fetch hex/BEEF/merkle proof; verify SPV proofs",
-	Long: `Fetch a transaction as JSON (default), raw hex, BEEF, or a TSC merkle
-proof.
+	Long: `Fetch a transaction as JSON (default), raw hex or bytes, BEEF, or a TSC
+merkle proof. In the JSON view test confirmation with "confirmed" (always
+present); "confirmations" is omitted while unconfirmed, and
+"confirmation_unknown" means the block read failed, so retry.
 
 --verify recomputes merkle roots locally and confirms them against an
 independent block-headers service (default per --chain; --headers-url to
@@ -39,6 +44,8 @@ with --proof it verifies the TSC path; otherwise it fetches the
 transaction's BEEF and verifies every BUMP in it.`,
 	Example: `  bb tx 4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b
   bb tx <txid> --hex
+  bb tx <txid> --bin -o tx.bin
+  bb tx <txid> --proof --target-type hash
   bb tx <txid> --beef -o tx.beef
   bb tx <txid> --proof --verify
   bb tx <txid> --verify`,
@@ -49,13 +56,29 @@ transaction's BEEF and verifies every BUMP in it.`,
 			return err
 		}
 		set := 0
-		for _, b := range []bool{txHex, txBeef, txProof} {
+		for _, b := range []bool{txHex, txBin, txBeef, txProof} {
 			if b {
 				set++
 			}
 		}
 		if set > 1 {
-			return errors.New("pick at most one of --hex, --beef, --proof")
+			return errors.New("pick at most one of --hex, --bin, --beef, --proof")
+		}
+		if txVerify && txBin {
+			return errors.New("--verify cannot be combined with --bin (use --proof, or omit --bin to verify the BEEF)")
+		}
+		if cmd.Flags().Changed("target-type") {
+			if !txProof {
+				return errors.New("--target-type applies only to --proof")
+			}
+			switch txTarget {
+			case "merkleRoot", "hash":
+			default:
+				return fmt.Errorf("--target-type must be merkleRoot or hash (got %q)", txTarget)
+			}
+			if txVerify && txTarget != "merkleRoot" {
+				return errors.New("--verify needs the merkle root as the proof target; omit --target-type or use merkleRoot")
+			}
 		}
 		// --hex just emits raw hex and returns before any verification runs, so
 		// combining it with --verify would silently do nothing (a false sense of
@@ -82,6 +105,15 @@ transaction's BEEF and verifies every BUMP in it.`,
 				return err
 			}
 			return writePayload(cmd, raw, true)
+
+		case txBin:
+			// The raw bytes, served without decoding: the cheapest way to
+			// fetch a transaction too large for the decoded JSON view.
+			raw, _, err := c.Bytes(ctx, base+"/bin", nil)
+			if err != nil {
+				return err
+			}
+			return writePayload(cmd, raw, false)
 
 		case txBeef:
 			raw, hdr, err := c.Bytes(ctx, base+"/beef", nil)
@@ -112,8 +144,12 @@ transaction's BEEF and verifies every BUMP in it.`,
 			return writePayload(cmd, raw, false)
 
 		case txProof:
+			var q url.Values
+			if txTarget != "" && txTarget != "merkleRoot" {
+				q = url.Values{"targetType": {txTarget}}
+			}
 			var proof spv.TSCProof
-			if err := c.GetJSON(ctx, base+"/proof", nil, &proof); err != nil {
+			if err := c.GetJSON(ctx, base+"/proof", q, &proof); err != nil {
 				return err
 			}
 			if txVerify {
@@ -141,11 +177,28 @@ transaction's BEEF and verifies every BUMP in it.`,
 		default:
 			var out json.RawMessage
 			if err := c.GetJSON(ctx, base, nil, &out); err != nil {
-				return err
+				return tooLargeHint(err, txid)
 			}
 			return render.JSON(cmd.OutOrStdout(), out)
 		}
 	},
+}
+
+// tooLargeHint points a 413 for the decoded view at the raw download. The
+// server answers 413 for transactions with more than 300,000 inputs plus
+// outputs (with a summary) and for any over 64 MiB (which no route serves).
+func tooLargeHint(err error, txid string) error {
+	var apiErr *api.Error
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusRequestEntityTooLarge {
+		return err
+	}
+	var body struct {
+		Summary json.RawMessage `json:"summary"`
+	}
+	if json.Unmarshal(apiErr.Body, &body) == nil && len(body.Summary) > 0 && string(body.Summary) != "null" {
+		return fmt.Errorf("%w\nsummary: %s\nthe transaction is too large to decode; fetch its raw bytes with: bb tx %s --bin -o tx.bin", err, body.Summary, txid)
+	}
+	return err
 }
 
 // writePayload writes raw to --output when set; otherwise to stdout, hex-
@@ -323,6 +376,8 @@ func headersToken() string {
 func init() {
 	f := txCmd.Flags()
 	f.BoolVar(&txHex, "hex", false, "output raw transaction hex")
+	f.BoolVar(&txBin, "bin", false, "output the raw transaction bytes (binary with -o, hex to stdout); cheapest for very large transactions")
+	f.StringVar(&txTarget, "target-type", "merkleRoot", "what --proof's target carries: merkleRoot or hash (block hash)")
 	f.BoolVar(&txBeef, "beef", false, "output BEEF (binary with -o, hex to stdout)")
 	f.BoolVar(&txProof, "proof", false, "output TSC merkle proof JSON")
 	f.BoolVar(&txVerify, "verify", false, "verify the merkle proof locally against block headers")

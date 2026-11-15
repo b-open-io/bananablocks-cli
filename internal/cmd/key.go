@@ -548,13 +548,14 @@ func settleProof(ctx context.Context, c *api.Client, errw io.Writer, store *x402
 				// record against it.
 				forgetPending(errw, store, e)
 				return nil, upgradeError(apiErr, e)
-			case apiErr.Status == http.StatusGone && withinSettleGrace(e):
+			case apiErr.Status == http.StatusGone && withinSettleGrace(errw, store, e):
 				// An early 410 (ARC does not report the payment yet) closes
 				// nothing on the server: if the network accepts it later it
 				// still settles up to a day after the challenge expired. Keep
 				// the proof resumable until then.
+				end, _ := settleGraceEnd(e)
 				return nil, fmt.Errorf("challenge %s has expired and payment %s is not accepted by the network yet; it can still settle until %s, so it stays saved — %s",
-					e.ChallengeID, e.Txid, settleGraceEnd(e).Format(time.RFC3339), resumeHint(store))
+					e.ChallengeID, e.Txid, end.Format(time.RFC3339), resumeHint(store))
 			case proofCannotSettle(apiErr):
 				// Stop resubmitting, but keep the challenge recorded as paid
 				// so a re-served copy of it is never paid again.
@@ -613,20 +614,31 @@ func forgetPending(errw io.Writer, store *x402.PendingStore, e *x402.PendingUpgr
 // settles a payment the network accepts late.
 const settleGrace = 24 * time.Hour
 
-// unknownExpiryGrace bounds an entry saved without the challenge's expiry
-// (by an older bb): challenges live minutes, so a week from saving covers any
-// realistic expiry plus settleGrace.
-const unknownExpiryGrace = 7 * 24 * time.Hour
-
-func settleGraceEnd(e *x402.PendingUpgrade) time.Time {
-	if !e.ExpiresAt.IsZero() {
-		return e.ExpiresAt.Add(settleGrace)
+// settleGraceEnd is when the server stops settling e's payment: a day after
+// the challenge's expires_at. For an entry saved without the expiry (by an
+// older bb) the first 410 bounds it: the challenge had expired by then.
+// With neither known, the window is treated as open.
+func settleGraceEnd(e *x402.PendingUpgrade) (time.Time, bool) {
+	switch {
+	case !e.ExpiresAt.IsZero():
+		return e.ExpiresAt.Add(settleGrace), true
+	case !e.FirstGoneAt.IsZero():
+		return e.FirstGoneAt.Add(settleGrace), true
 	}
-	return e.CreatedAt.Add(unknownExpiryGrace)
+	return time.Time{}, false
 }
 
-func withinSettleGrace(e *x402.PendingUpgrade) bool {
-	return nowFn().Before(settleGraceEnd(e))
+// withinSettleGrace reports whether a 410 for e may still be followed by a
+// settlement, recording the first 410 on an entry without a known expiry.
+func withinSettleGrace(errw io.Writer, store *x402.PendingStore, e *x402.PendingUpgrade) bool {
+	if e.ExpiresAt.IsZero() && e.FirstGoneAt.IsZero() {
+		e.FirstGoneAt = nowFn().UTC()
+		if err := store.Put(*e); err != nil {
+			fmt.Fprintf(errw, "warning: could not record the first 410 for payment %s in %s: %v\n", e.Txid, store.Path, err)
+		}
+	}
+	end, ok := settleGraceEnd(e)
+	return !ok || nowFn().Before(end)
 }
 
 // closePending marks a refused entry closed (see PendingUpgrade.ClosedAt).

@@ -1891,3 +1891,28 @@ func TestUpgrade410SettlementWindow(t *testing.T) {
 		t.Fatal("a 410 past the window must close the proof")
 	}
 }
+
+// A legacy entry (no saved expiry), however old, survives an early 410: the
+// first 410 starts a day-long window, and a later acceptance still settles.
+func TestUpgradeLegacy410Window(t *testing.T) {
+	store := useTempStore(t)
+	slept := fakeClock(t)
+	_ = slept
+	f := &fakeUpgradeServer{t: t, ch: testChallenge("ch-legacy-1")}
+	f.setReplies(
+		proofReply{status: http.StatusGone, body: `{"error":"challenge expired; request a new one"}`},
+		proofReply{status: http.StatusOK},
+	)
+	srv := f.start()
+	seedSavedAt(t, store, srv.URL, "ch-legacy-1", "legacy-proof", nowFn().Add(-30*24*time.Hour))
+	if _, _, err := runUpgrade(t, context.Background(), srv.URL, time.Minute); err == nil || !strings.Contains(err.Error(), "can still settle") {
+		t.Fatalf("legacy early 410: %v", err)
+	}
+	left := savedFor(t, store, srv.URL)
+	if len(left) != 1 || left[0].FirstGoneAt.IsZero() {
+		t.Fatalf("the first 410 must be recorded on the open entry: %+v", left)
+	}
+	if _, _, err := runUpgrade(t, context.Background(), srv.URL, time.Minute); err != nil {
+		t.Fatalf("later acceptance: %v", err)
+	}
+}

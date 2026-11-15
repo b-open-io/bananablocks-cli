@@ -34,6 +34,10 @@ type PendingUpgrade struct {
 	// ExpiresAt is the challenge's expires_at, when known. It bounds how long
 	// a closed entry must be kept (see closedRetention).
 	ExpiresAt time.Time `json:"expires_at,omitempty"`
+	// FirstGoneAt is when the server first answered 410 for this proof. The
+	// challenge had expired by then, so for an entry saved without ExpiresAt
+	// its settlement window ends at most a day after this.
+	FirstGoneAt time.Time `json:"first_gone_at,omitempty"`
 	// LastSubmitAt is when the proof was last sent to the server. A settle can
 	// only happen on a submit, so this bounds how recently it could have
 	// settled.

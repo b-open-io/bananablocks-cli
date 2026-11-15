@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -78,7 +79,13 @@ func canonicalOrigin(raw string) string {
 	}
 	scheme := strings.ToLower(u.Scheme)
 	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	if ip := net.ParseIP(host); ip != nil {
+		host = ip.String() // one spelling per address (IPv6 compression, IPv4-mapped)
+	}
 	port := u.Port()
+	if n, err := strconv.Atoi(port); err == nil {
+		port = strconv.Itoa(n) // "08080" and "8080" are one port
+	}
 	if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
 		port = ""
 	}

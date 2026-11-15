@@ -72,6 +72,14 @@ func TestStoreKeySpellingsShareScope(t *testing.T) {
 			t.Fatalf("%q must share the store of https://H.example/", h)
 		}
 	}
+	for _, pair := range [][2]string{
+		{"http://127.0.0.1:8080", "http://127.0.0.1:08080"},
+		{"http://[2001:db8::1]:80", "http://[2001:0db8:0000:0000:0000:0000:0000:0001]"},
+	} {
+		if NewProofStore(dir, pair[0], "k").Dir != NewProofStore(dir, pair[1], "k").Dir {
+			t.Fatalf("%q and %q must share a store", pair[0], pair[1])
+		}
+	}
 	if NewProofStore(dir, "https://h.example:8443", "bb_live_x").Dir == a.Dir {
 		t.Fatal("a non-default port is a different server")
 	}
@@ -95,7 +103,10 @@ func TestStorePaidFailsClosedOnUnreadableArchive(t *testing.T) {
 		t.Skip("root ignores directory permissions")
 	}
 	s := NewProofStore(t.TempDir(), "https://h", "k")
-	if err := os.MkdirAll(filepath.Join(s.Dir, "archive"), 0o000); err != nil {
+	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(s.Dir, "archive"), 0o000); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(filepath.Join(s.Dir, "archive"), 0o700) })

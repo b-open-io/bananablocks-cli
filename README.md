@@ -179,13 +179,16 @@ new challenge id; a second payment for the same challenge is not credited.
 id that already has a saved proof, even one saved under another spelling of
 the host or key.
 While a saved proof is unsettled, the rate-limit offer below does not pay
-either; it points you at `bb key upgrade`.
+either; it points you at `bb key upgrade`. Only one paying run per store may
+be active at a time; a second one exits at once.
 
 `bb` removes the saved entry when the upgrade settles, and when the server
-answers 404 `challenge not found`. When the server says the proof can never
-settle (409 payment request closed / payment already refused / key already on
-a tier at or above the challenge, 410 expired, 400/402, or a 422 rejected by
-broadcast that persists over three resubmits), `bb` stops resubmitting it and
+answers 404 `challenge not found`. A 422 (rejected by broadcast) is
+resubmitted up to three times and then kept saved for a rerun, since it is not
+always final; so is a 409 "key is already on a tier at or above this
+challenge", which a later resubmit can reconcile. When the server says the
+proof can never settle (409 payment request closed / payment already refused,
+410 expired, 400/402), `bb` stops resubmitting it and
 marks it **closed**: it no longer blocks new upgrades, but its challenge stays
 recorded as paid for a week, so if the server re-serves that same open
 challenge `bb` refuses to pay it again (only one payment ever settles a

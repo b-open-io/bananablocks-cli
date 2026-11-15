@@ -904,12 +904,14 @@ func TestUpgradeTerminalAndTransientAnswers(t *testing.T) {
 		wantSubmits int // 0 = exactly 1
 	}{
 		// "rejected by broadcast" is not always final: resubmitted
-		// max422Retries times, then the proof is closed.
-		{"422 rejected", proofReply{status: http.StatusUnprocessableEntity, body: `{"error":"transaction rejected by broadcast"}`}, "kept failing", false, max422Retries + 1},
+		// max422Retries times, then kept saved for a rerun.
+		{"422 rejected", proofReply{status: http.StatusUnprocessableEntity, body: `{"error":"transaction rejected by broadcast"}`}, "kept failing", true, max422Retries + 1},
 		// "payment txid already used" may have settled: the key's tier
 		// decides, as for "challenge already consumed".
 		{"409 txid used", proofReply{status: http.StatusConflict, body: `{"error":"payment txid already used"}`}, "already consumed", true, 0},
-		{"409 already on tier", proofReply{status: http.StatusConflict, body: `{"error":"key is already on a tier at or above this challenge"}`}, "No tier was granted", false, 0},
+		// May reconcile or settle later: kept saved, not closed.
+		{"409 already on tier", proofReply{status: http.StatusConflict, body: `{"error":"key is already on a tier at or above this challenge"}`}, "No tier was granted", true, 0},
+		{"409 request closed", proofReply{status: http.StatusConflict, body: `{"error":"payment request closed: a payment to it was refused and is recorded for a refund or a manual credit; request a new one"}`}, "can never settle", false, 0},
 		{"400 malformed", proofReply{status: http.StatusBadRequest, body: `{"error":"malformed payment proof"}`}, "malformed", false, 0},
 		{"402 insufficient", proofReply{status: http.StatusPaymentRequired, body: `{"error":"payment insufficient"}`}, "insufficient", false, 0},
 		{"410 expired", proofReply{status: http.StatusGone, body: `{"error":"challenge expired; request a new one"}`}, "expired", false, 0},
@@ -1775,5 +1777,26 @@ func TestUpgradeProofDoesNotFollowRedirects(t *testing.T) {
 	}
 	if len(savedFor(t, store, srv.URL)) != 1 {
 		t.Fatal("a redirect must not drop or close the saved proof")
+	}
+}
+
+// Two runs cannot pay at once: the second fails fast while the first holds
+// the run lock.
+func TestUpgradeRunLockIsExclusive(t *testing.T) {
+	store := useTempStore(t)
+	unlock, err := store.LockRun()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	builds := countBuilds(t)
+	f := &fakeUpgradeServer{t: t, ch: testChallenge("ch-lock-1")}
+	f.setReplies(proofReply{status: http.StatusOK})
+	srv := f.start()
+	if _, _, err := runUpgrade(t, context.Background(), srv.URL, time.Minute); !errors.Is(err, x402.ErrUpgradeRunning) {
+		t.Fatalf("want ErrUpgradeRunning, got %v", err)
+	}
+	if *builds != 0 {
+		t.Fatal("a locked-out run built a payment")
 	}
 }

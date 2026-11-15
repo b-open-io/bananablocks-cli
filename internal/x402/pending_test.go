@@ -1,9 +1,11 @@
 package x402
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -272,5 +274,35 @@ func TestPendingStoreCloseKeepsChallengeRecord(t *testing.T) {
 	}
 	if same, _ := s.ForChallenge("c1"); len(same) != 0 {
 		t.Fatal("an expired closed record should be pruned")
+	}
+}
+
+// Concurrent writers never lose each other's entries.
+func TestPendingStoreConcurrentMutations(t *testing.T) {
+	s := &PendingStore{Path: filepath.Join(t.TempDir(), "p.json")}
+	const n = 40
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			id := fmt.Sprintf("c%d", i)
+			if err := s.Put(PendingUpgrade{KeyFingerprint: "fp", ChallengeID: id, Proof: "p"}); err != nil {
+				t.Error(err)
+			}
+			if i%2 == 0 {
+				if err := s.Close("fp", id, "x", time.Now()); err != nil {
+					t.Error(err)
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	all, err := s.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != n {
+		t.Fatalf("lost updates: %d of %d entries survived", len(all), n)
 	}
 }

@@ -100,6 +100,15 @@ paying again, even after the challenge has expired.`,
 		if err != nil {
 			return err
 		}
+		if !upgradeDryRun {
+			// Held from the first look at the saved payments until this run's
+			// own payment settles, so two runs cannot pay one challenge.
+			unlock, err := store.LockRun()
+			if err != nil {
+				return err
+			}
+			defer unlock()
+		}
 		fp := x402.KeyFingerprint(c.BaseURL, c.APIKey)
 		saved, err := store.ForKey(fp)
 		if err != nil {
@@ -529,7 +538,8 @@ func settleProof(ctx context.Context, c *api.Client, errw io.Writer, store *x402
 				// "transaction rejected by broadcast": the server's rebroadcast
 				// failed (ARC refused it or was unreachable) and nothing was
 				// recorded. Not always final, and resubmitting the same proof
-				// is safe, so retry a few times before giving up on it.
+				// is safe, so retry a few times; past that the proof stays
+				// saved for a rerun to resume.
 				rejected++
 				pending = &pendingReply{RetryAfter: defaultPendingRetry, Message: apiErr.Message}
 			case isChallengeNotFound(apiErr):
@@ -610,10 +620,14 @@ func isChallengeConsumed(apiErr *api.Error) bool {
 
 // proofCannotSettle reports the answers after which resubmitting the same
 // proof can never succeed: malformed (400), wrong script or underpaid (402),
-// unknown challenge (404 "challenge not found"), payment txid already used or
-// key already at the tier (409, other than "challenge already consumed"),
-// expired with no payment the network holds (410), and rejected by broadcast
-// (422).
+// unknown challenge (404 "challenge not found"), the challenge closed or the
+// payment refused and recorded for a refund (409), and expired (410).
+//
+// Not included, so the proof stays saved and resumable: a 422 "rejected by
+// broadcast" (the API calls it not always final), the 409 "key is already on
+// a tier at or above this challenge" (a later resubmit can reconcile it or
+// settle once that tier lapses), and "challenge already consumed" / "payment
+// txid already used" (confirmed against the key's tier instead).
 //
 // A 404 counts only with the upgrade handler's own body. Any other 404 (a node
 // where the route is not mounted answers a bare "404 page not found") says
@@ -623,8 +637,9 @@ func proofCannotSettle(apiErr *api.Error) bool {
 	switch apiErr.Status {
 	case http.StatusNotFound:
 		return isChallengeNotFound(apiErr)
-	case http.StatusBadRequest, http.StatusPaymentRequired,
-		http.StatusConflict, http.StatusGone, http.StatusUnprocessableEntity:
+	case http.StatusConflict:
+		return !strings.Contains(strings.ToLower(apiErr.Message), "already on a tier")
+	case http.StatusBadRequest, http.StatusPaymentRequired, http.StatusGone:
 		return true
 	}
 	return false
@@ -764,7 +779,7 @@ func upgradeError(apiErr *api.Error, e *x402.PendingUpgrade) error {
 		msg := strings.ToLower(apiErr.Message)
 		switch {
 		case strings.Contains(msg, "already on a tier"):
-			return fmt.Errorf("upgrade refused: %s. No tier was granted; check `bb key usage` and ask the operator to check payment %s's payment and refusal records before expecting a credit or refund. %s",
+			return fmt.Errorf("upgrade refused: %s. No tier was granted; check `bb key usage` and ask the operator to check payment %s's payment and refusal records before expecting a credit or refund. The proof stays saved: a later `bb key upgrade` resubmits it to reconcile, or settles it once the blocking tier lapses. %s",
 				apiErr.Message, e.Txid, checkInputs)
 		case strings.Contains(msg, "payment request closed"), strings.Contains(msg, "payment already refused"):
 			return fmt.Errorf("upgrade refused: %s. Resubmitting payment %s can never settle it; rerun `bb key upgrade` for a new challenge if you still want the upgrade. %s, and contact the operator if it is mined",
@@ -776,7 +791,7 @@ func upgradeError(apiErr *api.Error, e *x402.PendingUpgrade) error {
 	case http.StatusGone:
 		return fmt.Errorf("challenge expired (payment %s): if the network accepted the payment it is recorded for a refund or a manual credit by the operator. Rerun `bb key upgrade` for a new challenge; %s", e.Txid, checkInputs)
 	case http.StatusUnprocessableEntity:
-		return fmt.Errorf("the server's broadcast of payment %s kept failing (%s): ARC rejected it or could not be reached. %s before paying again", e.Txid, apiErr.Message, checkInputs)
+		return fmt.Errorf("the server's broadcast of payment %s kept failing (%s): ARC rejected it or could not be reached, and it may still be accepted later. %s", e.Txid, apiErr.Message, checkInputs)
 	default:
 		return apiErr
 	}
@@ -883,6 +898,11 @@ func payChallenge(ctx context.Context, errw io.Writer, wif string, ch *x402.Chal
 	if err != nil {
 		return err
 	}
+	unlock, err := store.LockRun()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	fp := x402.KeyFingerprint(c.BaseURL, c.APIKey)
 	saved, err := store.ForKey(fp)
 	if err != nil {

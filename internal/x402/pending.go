@@ -215,41 +215,92 @@ func (s *PendingStore) Put(e PendingUpgrade) error {
 	if e.KeyFingerprint == "" || e.ChallengeID == "" || e.Proof == "" {
 		return errors.New("a saved x402 payment needs a key fingerprint, challenge id and proof")
 	}
-	all, err := s.load()
-	if err != nil {
-		return err
-	}
-	replaced := false
-	for i := range all {
-		if all[i].KeyFingerprint == e.KeyFingerprint && all[i].ChallengeID == e.ChallengeID {
-			all[i] = e
-			replaced = true
+	return s.mutate(func(all []PendingUpgrade) ([]PendingUpgrade, bool) {
+		replaced := false
+		for i := range all {
+			if all[i].KeyFingerprint == e.KeyFingerprint && all[i].ChallengeID == e.ChallengeID {
+				all[i] = e
+				replaced = true
+			}
 		}
-	}
-	if !replaced {
-		all = append(all, e)
-	}
-	return s.save(all)
+		if !replaced {
+			all = append(all, e)
+		}
+		return all, true
+	})
 }
 
 // Delete removes the entry for a key and challenge. Deleting an entry that
 // is not there is not an error.
 func (s *PendingStore) Delete(fingerprint, challengeID string) error {
+	return s.mutate(func(all []PendingUpgrade) ([]PendingUpgrade, bool) {
+		kept := all[:0]
+		for _, e := range all {
+			if e.KeyFingerprint == fingerprint && e.ChallengeID == challengeID {
+				continue
+			}
+			kept = append(kept, e)
+		}
+		return kept, len(kept) != len(all)
+	})
+}
+
+// mutate runs one read-modify-write of the file under a process-shared lock,
+// so concurrent runs cannot lose each other's updates (a stale snapshot
+// saved over a newer file would erase a proof that was just submitted).
+func (s *PendingStore) mutate(fn func([]PendingUpgrade) ([]PendingUpgrade, bool)) error {
+	unlock, err := s.lock(s.Path+".lock", false)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	all, err := s.load()
 	if err != nil {
 		return err
 	}
-	kept := all[:0]
-	for _, e := range all {
-		if e.KeyFingerprint == fingerprint && e.ChallengeID == challengeID {
-			continue
-		}
-		kept = append(kept, e)
-	}
-	if len(kept) == len(all) {
+	next, changed := fn(all)
+	if !changed {
 		return nil
 	}
-	return s.save(kept)
+	return s.save(next)
+}
+
+// ErrUpgradeRunning is returned by LockRun when another process holds it.
+var ErrUpgradeRunning = errors.New("another `bb key upgrade` (or inline upgrade) is running; wait for it to finish — two runs at once could pay the same challenge twice")
+
+// LockRun takes the lock a paying run holds from its first look at the saved
+// payments until its own payment is saved and settled, so two runs cannot
+// both see nothing saved and pay the same challenge. It fails at once if
+// another run holds it.
+func (s *PendingStore) LockRun() (func(), error) {
+	unlock, err := s.lock(s.Path+".run.lock", true)
+	if err != nil {
+		if errors.Is(err, errLockBusy) {
+			return nil, ErrUpgradeRunning
+		}
+		return nil, err
+	}
+	return unlock, nil
+}
+
+var errLockBusy = errors.New("lock busy")
+
+func (s *PendingStore) lock(path string, nonBlocking bool) (func(), error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := lockFile(f, nonBlocking); err != nil {
+		_ = f.Close()
+		if nonBlocking {
+			return nil, errLockBusy
+		}
+		return nil, fmt.Errorf("locking %s: %w", path, err)
+	}
+	return func() { _ = f.Close() }, nil
 }
 
 // closedRetention is how long a closed entry is kept as a record that its
@@ -260,20 +311,18 @@ const closedRetention = 7 * 24 * time.Hour
 // Close marks the entry for a key and challenge as refused for good (see
 // PendingUpgrade.ClosedAt) and drops closed entries past closedRetention.
 func (s *PendingStore) Close(fingerprint, challengeID, reason string, now time.Time) error {
-	all, err := s.load()
-	if err != nil {
-		return err
-	}
-	kept := all[:0]
-	for _, e := range all {
-		if e.KeyFingerprint == fingerprint && e.ChallengeID == challengeID && !e.Closed() {
-			e.ClosedAt = now.UTC()
-			e.ClosedReason = reason
+	return s.mutate(func(all []PendingUpgrade) ([]PendingUpgrade, bool) {
+		kept := all[:0]
+		for _, e := range all {
+			if e.KeyFingerprint == fingerprint && e.ChallengeID == challengeID && !e.Closed() {
+				e.ClosedAt = now.UTC()
+				e.ClosedReason = reason
+			}
+			if e.Closed() && now.Sub(e.ClosedAt) > closedRetention {
+				continue
+			}
+			kept = append(kept, e)
 		}
-		if e.Closed() && now.Sub(e.ClosedAt) > closedRetention {
-			continue
-		}
-		kept = append(kept, e)
-	}
-	return s.save(kept)
+		return kept, true
+	})
 }

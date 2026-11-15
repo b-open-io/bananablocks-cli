@@ -177,12 +177,22 @@ func (s *ProofStore) Paid(challengeID string) (*SavedProof, error) {
 	if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	matches, err := filepath.Glob(filepath.Join(s.archiveDir(), challengeKey(challengeID)+"-*.json"))
+	// Read the literal directory (not a glob, which would treat metacharacters
+	// in the state path as a pattern) and fail closed on anything but a
+	// genuinely absent archive.
+	entries, err := os.ReadDir(s.archiveDir())
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
-	for _, m := range matches {
-		p, err := readProof(m)
+	prefix := challengeKey(challengeID) + "-"
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), prefix) || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		p, err := readProof(filepath.Join(s.archiveDir(), e.Name()))
 		if err != nil {
 			return nil, err
 		}

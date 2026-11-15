@@ -1,6 +1,8 @@
 package x402
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -72,5 +74,32 @@ func TestStoreKeySpellingsShareScope(t *testing.T) {
 	}
 	if NewProofStore(dir, "https://h.example:8443", "bb_live_x").Dir == a.Dir {
 		t.Fatal("a non-default port is a different server")
+	}
+}
+
+func TestStorePaidWithGlobMetacharactersInPath(t *testing.T) {
+	s := NewProofStore(filepath.Join(t.TempDir(), "bb[prod]*?"), "https://h", "k")
+	if err := s.Save(&SavedProof{ChallengeID: "c", Txid: "aa", ProofHeader: "h"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Archive("c", "aa", "abandoned"); err != nil {
+		t.Fatal(err)
+	}
+	if p, err := s.Paid("c"); err != nil || p == nil {
+		t.Fatalf("archived challenge not found under a metacharacter path: %v, %v", p, err)
+	}
+}
+
+func TestStorePaidFailsClosedOnUnreadableArchive(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	s := NewProofStore(t.TempDir(), "https://h", "k")
+	if err := os.MkdirAll(filepath.Join(s.Dir, "archive"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(s.Dir, "archive"), 0o700) })
+	if _, err := s.Paid("c"); err == nil {
+		t.Fatal("an unreadable archive must fail closed")
 	}
 }

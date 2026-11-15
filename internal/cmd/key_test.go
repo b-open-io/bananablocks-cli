@@ -197,26 +197,30 @@ func TestChallengeFromResponseHeaderFallback(t *testing.T) {
 	}
 }
 
-// TestUpgradeErrorMapping checks the status → message taxonomy.
+// TestUpgradeErrorMapping checks the status → message taxonomy: every
+// terminal answer names the payment, and none advises paying again.
 func TestUpgradeErrorMapping(t *testing.T) {
+	e := &x402.PendingUpgrade{Txid: "tx-1"}
 	cases := []struct {
 		status int
+		msg    string
 		want   string
 	}{
-		{http.StatusConflict, "payment txid already used"},
-		{http.StatusGone, "expired"},
-		{http.StatusUnprocessableEntity, "rejected"},
+		{http.StatusPaymentRequired, "payment insufficient", "do not pay this challenge again"},
+		{http.StatusConflict, "key is already on a tier at or above this challenge", "No tier was granted"},
+		{http.StatusConflict, "payment request closed: a payment to it was refused and is recorded for a refund or a manual credit; request a new one", "can never settle"},
+		{http.StatusConflict, "payment already refused and recorded for a refund or a manual credit", "can never settle"},
+		{http.StatusGone, "challenge expired; request a new one", "refund"},
+		{http.StatusUnprocessableEntity, "transaction rejected by broadcast", "kept failing"},
 	}
 	for _, tc := range cases {
-		err := upgradeError(&api.Error{Status: tc.status, Message: "payment txid already used"})
-		if !strings.Contains(err.Error(), tc.want) {
-			t.Errorf("status %d → %q, want it to mention %q", tc.status, err, tc.want)
+		err := upgradeError(&api.Error{Status: tc.status, Message: tc.msg}, e)
+		if !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), "tx-1") {
+			t.Errorf("%d %q → %q, want it to mention %q and the txid", tc.status, tc.msg, err, tc.want)
 		}
-	}
-	// The server raises a replay 409 after broadcasting the tx, so the message
-	// must not tell the payer it was not broadcast.
-	if err := upgradeError(&api.Error{Status: http.StatusConflict, Message: "payment txid already used"}); strings.Contains(err.Error(), "not broadcast") {
-		t.Errorf("409 message claims the tx was not broadcast: %q", err)
+		if strings.Contains(err.Error(), "rerun to retry") || strings.Contains(err.Error(), "not broadcast") {
+			t.Errorf("%d %q → %q must not advise paying again or claim no broadcast", tc.status, tc.msg, err)
+		}
 	}
 }
 
@@ -888,8 +892,9 @@ func TestUpgradeConsumedChecksTier(t *testing.T) {
 	}
 }
 
-// Answers after which the proof can never settle drop it; transient ones
-// keep it for a rerun.
+// Answers after which the proof can never settle close it (it stops being
+// resubmitted but its challenge stays recorded as paid); transient ones keep
+// it open for a rerun.
 func TestUpgradeTerminalAndTransientAnswers(t *testing.T) {
 	cases := []struct {
 		name        string
@@ -898,8 +903,13 @@ func TestUpgradeTerminalAndTransientAnswers(t *testing.T) {
 		wantSaved   bool
 		wantSubmits int // 0 = exactly 1
 	}{
-		{"422 rejected", proofReply{status: http.StatusUnprocessableEntity, body: `{"error":"transaction rejected by broadcast"}`}, "rejected", false, 0},
-		{"409 txid used", proofReply{status: http.StatusConflict, body: `{"error":"payment txid already used"}`}, "txid already used", false, 0},
+		// "rejected by broadcast" is not always final: resubmitted
+		// max422Retries times, then the proof is closed.
+		{"422 rejected", proofReply{status: http.StatusUnprocessableEntity, body: `{"error":"transaction rejected by broadcast"}`}, "kept failing", false, max422Retries + 1},
+		// "payment txid already used" may have settled: the key's tier
+		// decides, as for "challenge already consumed".
+		{"409 txid used", proofReply{status: http.StatusConflict, body: `{"error":"payment txid already used"}`}, "already consumed", true, 0},
+		{"409 already on tier", proofReply{status: http.StatusConflict, body: `{"error":"key is already on a tier at or above this challenge"}`}, "No tier was granted", false, 0},
 		{"400 malformed", proofReply{status: http.StatusBadRequest, body: `{"error":"malformed payment proof"}`}, "malformed", false, 0},
 		{"402 insufficient", proofReply{status: http.StatusPaymentRequired, body: `{"error":"payment insufficient"}`}, "insufficient", false, 0},
 		{"410 expired", proofReply{status: http.StatusGone, body: `{"error":"challenge expired; request a new one"}`}, "expired", false, 0},
@@ -1674,5 +1684,96 @@ func TestUpgradeRejectsNegativeWait(t *testing.T) {
 	}
 	if *builds != 0 {
 		t.Fatalf("built %d payments despite a negative --wait", *builds)
+	}
+}
+
+// A 402 on submit closes the proof; when the server re-serves that same open
+// challenge, the next run refuses to pay it again (a second payment is never
+// credited), even though the closed entry no longer blocks other upgrades.
+func TestUpgradeNeverRepaysClosedChallenge(t *testing.T) {
+	store := useTempStore(t)
+	fakeClock(t)
+	builds := countBuilds(t)
+	f := &fakeUpgradeServer{t: t, ch: testChallenge("ch-closed-1")}
+	f.setReplies(proofReply{status: http.StatusPaymentRequired, body: `{"error":"payment insufficient"}`})
+	srv := f.start()
+
+	if _, _, err := runUpgrade(t, context.Background(), srv.URL, time.Minute); err == nil || !strings.Contains(err.Error(), "do not pay this challenge again") {
+		t.Fatalf("first run: %v", err)
+	}
+	if *builds != 1 {
+		t.Fatalf("first run built %d payments", *builds)
+	}
+	if len(savedFor(t, store, srv.URL)) != 0 {
+		t.Fatal("a closed proof must not stay open")
+	}
+
+	_, _, err := runUpgrade(t, context.Background(), srv.URL, time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "never credited") {
+		t.Fatalf("re-served closed challenge must be refused, got %v", err)
+	}
+	if *builds != 1 {
+		t.Fatalf("paid a closed challenge again (%d builds)", *builds)
+	}
+
+	// --dry-run still shows the challenge, with a note.
+	out, errOut, err := runUpgradeMode(t, context.Background(), srv.URL, time.Minute, true)
+	if err != nil || !strings.Contains(errOut, "never credited") || !strings.Contains(out, "ch-closed-1") {
+		t.Fatalf("dry-run: err=%v stderr=%q stdout=%q", err, errOut, out)
+	}
+
+	// A different (fresh) challenge is payable again.
+	f.mu.Lock()
+	f.ch = testChallenge("ch-fresh-1")
+	f.proofs = nil
+	f.mu.Unlock()
+	f.setReplies(proofReply{status: http.StatusOK})
+	if _, _, err := runUpgrade(t, context.Background(), srv.URL, time.Minute); err != nil {
+		t.Fatalf("fresh challenge: %v", err)
+	}
+}
+
+// The inline rate-limit offer refuses a challenge a closed proof already paid.
+func TestPayChallengeRefusesClosedChallenge(t *testing.T) {
+	store := useTempStore(t)
+	seedSaved(t, store, "https://example.invalid", "ch-inline-closed", "p")
+	if err := store.Close(x402.KeyFingerprint("https://example.invalid", "bb_live_test"), "ch-inline-closed", "payment insufficient", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	oldHost, oldKey := flagHost, flagAPIKey
+	flagHost, flagAPIKey = "https://example.invalid", "bb_live_test"
+	defer func() { flagHost, flagAPIKey = oldHost, oldKey }()
+	err := payChallenge(context.Background(), io.Discard, testWIF, testChallenge("ch-inline-closed"))
+	if err == nil || !strings.Contains(err.Error(), "never credited") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+// A proof is never carried across a redirect, and a redirect cannot close
+// or drop the saved entry.
+func TestUpgradeProofDoesNotFollowRedirects(t *testing.T) {
+	store := useTempStore(t)
+	fakeClock(t)
+	var leaked int
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leaked++
+		w.WriteHeader(http.StatusNotFound)
+		io.WriteString(w, `{"error":"challenge not found"}`)
+	}))
+	defer other.Close()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	defer srv.Close()
+	seedSaved(t, store, srv.URL, "ch-redir-1", "saved-proof")
+
+	if _, _, err := runUpgrade(t, context.Background(), srv.URL, time.Minute); err == nil {
+		t.Fatal("want an error")
+	}
+	if leaked != 0 {
+		t.Fatal("the proof followed a redirect")
+	}
+	if len(savedFor(t, store, srv.URL)) != 1 {
+		t.Fatal("a redirect must not drop or close the saved proof")
 	}
 }

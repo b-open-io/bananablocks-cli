@@ -130,6 +130,14 @@ paying again, even after the challenge has expired.`,
 		if err != nil {
 			return err
 		}
+		same, err = refuseClosedChallenge(same, ch)
+		if err != nil {
+			if upgradeDryRun {
+				fmt.Fprintln(errw, "note:", err)
+				return render.JSON(cmd.OutOrStdout(), ch)
+			}
+			return err
+		}
 		if len(same) > 0 {
 			if !upgradeDryRun {
 				return resumeSaved(cmd, c, store, same)
@@ -190,6 +198,25 @@ paying again, even after the challenge has expired.`,
 		fmt.Fprintln(errw, settledLine(res))
 		return render.JSON(cmd.OutOrStdout(), res)
 	},
+}
+
+// refuseClosedChallenge fails when ch was already paid by a proof the server
+// refused for good: the server re-serves an open challenge, and a second
+// payment to it is never credited. Otherwise it returns the open entries.
+func refuseClosedChallenge(entries []x402.PendingUpgrade, ch *x402.Challenge) ([]x402.PendingUpgrade, error) {
+	var open []x402.PendingUpgrade
+	for _, e := range entries {
+		if e.Closed() {
+			when := "it expires"
+			if !ch.ExpiresAt.IsZero() {
+				when = ch.ExpiresAt.Format(time.RFC3339)
+			}
+			return nil, fmt.Errorf("the server re-served challenge %s, which payment %s already paid (refused: %s); a second payment to it is never credited — rerun after %s for a new challenge, and check that payment's status before you reuse its inputs",
+				ch.ChallengeID, e.Txid, e.ClosedReason, when)
+		}
+		open = append(open, e)
+	}
+	return open, nil
 }
 
 // resumeSaved resubmits the oldest of the given saved proofs instead of paying
@@ -353,6 +380,10 @@ const (
 	defaultPendingRetry = 10 * time.Second
 	minPendingRetry     = time.Second
 	maxPendingRetry     = 60 * time.Second
+	// max422Retries bounds resubmits after "transaction rejected by
+	// broadcast": the API calls it not always final, but a payment whose
+	// inputs were spent elsewhere answers it forever.
+	max422Retries = 3
 )
 
 // parseRetryAfter reads a Retry-After of integer seconds, clamped to
@@ -396,7 +427,14 @@ func submitProof(ctx context.Context, c *api.Client, payURL, proofHdr string) (*
 		return nil, nil, err
 	}
 	req.Header.Set("X402-Proof", proofHdr)
-	resp, err := c.Do(req)
+	// Never follow a redirect with a proof: it would carry the signed payment
+	// and the API key wherever Location points, and let that answer decide
+	// the saved entry's fate. A 3xx comes back as an error that keeps it.
+	nc := *c
+	hc := *c.HTTP
+	hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	nc.HTTP = &hc
+	resp, err := nc.Do(req)
 	if err != nil {
 		var apiErr *api.Error
 		if errors.As(err, &apiErr) {
@@ -444,6 +482,7 @@ func submitProof(ctx context.Context, c *api.Client, payURL, proofHdr string) (*
 func settleProof(ctx context.Context, c *api.Client, errw io.Writer, store *x402.PendingStore, e *x402.PendingUpgrade, wait time.Duration) (*x402.UpgradeResult, error) {
 	start := nowFn()
 	deadline := start.Add(wait)
+	rejected := 0
 	for {
 		prevLast, prevSubmit := e.LastSubmitAt, e.LastActivity()
 		markSubmit(errw, store, e)
@@ -486,11 +525,25 @@ func settleProof(ctx context.Context, c *api.Client, errw io.Writer, store *x402
 				// the server failing to read the payment's network status.
 				// Neither says anything about the proof: wait and resubmit it.
 				pending = &pendingReply{RetryAfter: parseRetryAfter(apiErr.Header.Get("Retry-After")), Message: apiErr.Error()}
-			case proofCannotSettle(apiErr):
+			case apiErr.Status == http.StatusUnprocessableEntity && rejected < max422Retries:
+				// "transaction rejected by broadcast": the server's rebroadcast
+				// failed (ARC refused it or was unreachable) and nothing was
+				// recorded. Not always final, and resubmitting the same proof
+				// is safe, so retry a few times before giving up on it.
+				rejected++
+				pending = &pendingReply{RetryAfter: defaultPendingRetry, Message: apiErr.Message}
+			case isChallengeNotFound(apiErr):
+				// The server has no such challenge for this key: nothing to
+				// record against it.
 				forgetPending(errw, store, e)
-				return nil, upgradeError(apiErr)
+				return nil, upgradeError(apiErr, e)
+			case proofCannotSettle(apiErr):
+				// Stop resubmitting, but keep the challenge recorded as paid
+				// so a re-served copy of it is never paid again.
+				closePending(errw, store, e, apiErr.Message)
+				return nil, upgradeError(apiErr, e)
 			default:
-				return nil, fmt.Errorf("submitting payment %s: %w; %s", e.Txid, upgradeError(apiErr), resumeHint(store))
+				return nil, fmt.Errorf("submitting payment %s: %w; %s", e.Txid, upgradeError(apiErr, e), resumeHint(store))
 			}
 		}
 		if nowFn().Add(pending.RetryAfter).After(deadline) {
@@ -538,8 +591,21 @@ func forgetPending(errw io.Writer, store *x402.PendingStore, e *x402.PendingUpgr
 	}
 }
 
+// closePending marks a refused entry closed (see PendingUpgrade.ClosedAt).
+// Failing to record it is only a warning: the entry then stays open and the
+// next run resubmits it and gets the same answer.
+func closePending(errw io.Writer, store *x402.PendingStore, e *x402.PendingUpgrade, reason string) {
+	if err := store.Close(e.KeyFingerprint, e.ChallengeID, reason, nowFn()); err != nil {
+		fmt.Fprintf(errw, "warning: could not record refused payment %s in %s: %v\n", e.Txid, store.Path, err)
+	}
+}
+
+// isChallengeConsumed matches the two 409s the API documents as terminal
+// for the proof but possibly already settled: "challenge already consumed"
+// and "payment txid already used". Either way the key's tier decides.
 func isChallengeConsumed(apiErr *api.Error) bool {
-	return apiErr.Status == http.StatusConflict && strings.Contains(apiErr.Message, "challenge already consumed")
+	return apiErr.Status == http.StatusConflict &&
+		(strings.Contains(apiErr.Message, "challenge already consumed") || strings.Contains(apiErr.Message, "payment txid already used"))
 }
 
 // proofCannotSettle reports the answers after which resubmitting the same
@@ -685,24 +751,32 @@ func submitPath(payURL, baseURL string) string {
 	return p
 }
 
-// upgradeError maps the server's x402 error statuses onto actionable messages.
-func upgradeError(apiErr *api.Error) error {
+// upgradeError maps a terminal x402 answer for payment e onto the guidance
+// the API documents. None of them may suggest paying the challenge again:
+// only one payment settles a challenge.
+func upgradeError(apiErr *api.Error, e *x402.PendingUpgrade) error {
+	checkInputs := "check the transaction's status before you reuse its inputs, even if it was broadcast elsewhere"
 	switch apiErr.Status {
 	case http.StatusPaymentRequired:
-		if ch, err := challengeFromResponse(apiErr); err == nil {
-			return fmt.Errorf("payment insufficient: the challenge wants %d sats to %s (challenge still open — rerun to retry)",
-				ch.AmountSats, ch.PayeeDisplay())
-		}
-		return fmt.Errorf("payment insufficient: %s", apiErr.Message)
+		return fmt.Errorf("payment %s was not accepted for the challenge (%s); do not pay this challenge again — a second payment is never credited. %s, and contact the operator",
+			e.Txid, apiErr.Message, checkInputs)
 	case http.StatusConflict:
+		msg := strings.ToLower(apiErr.Message)
+		switch {
+		case strings.Contains(msg, "already on a tier"):
+			return fmt.Errorf("upgrade refused: %s. No tier was granted; check `bb key usage` and ask the operator to check payment %s's payment and refusal records before expecting a credit or refund. %s",
+				apiErr.Message, e.Txid, checkInputs)
+		case strings.Contains(msg, "payment request closed"), strings.Contains(msg, "payment already refused"):
+			return fmt.Errorf("upgrade refused: %s. Resubmitting payment %s can never settle it; rerun `bb key upgrade` for a new challenge if you still want the upgrade. %s, and contact the operator if it is mined",
+				apiErr.Message, e.Txid, checkInputs)
+		}
 		// No claim about whether the tx was broadcast: the server raises
-		// "payment txid already used" and a settle-time "already at or above
-		// this tier" AFTER broadcasting it.
-		return fmt.Errorf("upgrade refused: %s", apiErr.Message)
+		// several 409s AFTER broadcasting it.
+		return fmt.Errorf("upgrade refused: %s; %s", apiErr.Message, checkInputs)
 	case http.StatusGone:
-		return errors.New("challenge expired; rerun to request a fresh one")
+		return fmt.Errorf("challenge expired (payment %s): if the network accepted the payment it is recorded for a refund or a manual credit by the operator. Rerun `bb key upgrade` for a new challenge; %s", e.Txid, checkInputs)
 	case http.StatusUnprocessableEntity:
-		return fmt.Errorf("broadcast rejected the payment transaction: %s — check the funding UTXOs are unspent", apiErr.Message)
+		return fmt.Errorf("the server's broadcast of payment %s kept failing (%s): ARC rejected it or could not be reached. %s before paying again", e.Txid, apiErr.Message, checkInputs)
 	default:
 		return apiErr
 	}
@@ -818,6 +892,9 @@ func payChallenge(ctx context.Context, errw io.Writer, wif string, ch *x402.Chal
 	// fingerprint it was saved under (the server scopes challenges to keys).
 	same, err := store.ForChallenge(ch.ChallengeID)
 	if err != nil {
+		return err
+	}
+	if same, err = refuseClosedChallenge(same, ch); err != nil {
 		return err
 	}
 	saved = append(saved, same...)

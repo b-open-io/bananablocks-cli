@@ -245,3 +245,32 @@ func TestPendingLastActivity(t *testing.T) {
 		t.Fatal("a submit time before the save time is ignored")
 	}
 }
+
+func TestPendingStoreCloseKeepsChallengeRecord(t *testing.T) {
+	s := &PendingStore{Path: filepath.Join(t.TempDir(), "p.json")}
+	now := time.Now()
+	e := PendingUpgrade{KeyFingerprint: "fp", ChallengeID: "c1", Proof: "p", Txid: "t"}
+	if err := s.Put(e); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close("fp", "c1", "payment insufficient", now); err != nil {
+		t.Fatal(err)
+	}
+	if open, _ := s.ForKey("fp"); len(open) != 0 {
+		t.Fatal("a closed entry must not be returned as open")
+	}
+	same, _ := s.ForChallenge("c1")
+	if len(same) != 1 || !same[0].Closed() || same[0].ClosedReason != "payment insufficient" {
+		t.Fatalf("closed entry must still record its challenge: %+v", same)
+	}
+	// Past the retention it is pruned on the next Close.
+	if err := s.Put(PendingUpgrade{KeyFingerprint: "fp", ChallengeID: "c2", Proof: "p"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close("fp", "c2", "x", now.Add(closedRetention+time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if same, _ := s.ForChallenge("c1"); len(same) != 0 {
+		t.Fatal("an expired closed record should be pruned")
+	}
+}

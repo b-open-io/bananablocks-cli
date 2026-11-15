@@ -35,7 +35,17 @@ type PendingUpgrade struct {
 	// only happen on a submit, so this bounds how recently it could have
 	// settled.
 	LastSubmitAt time.Time `json:"last_submit_at,omitempty"`
+
+	// ClosedAt marks a proof the server refused for good. It is no longer
+	// resubmitted and no longer blocks new upgrades, but its challenge stays
+	// recorded as paid: only one payment settles a challenge, and the server
+	// re-serves an open one, so paying it again would never be credited.
+	ClosedAt     time.Time `json:"closed_at,omitempty"`
+	ClosedReason string    `json:"closed_reason,omitempty"`
 }
+
+// Closed reports whether the server refused this proof for good.
+func (e PendingUpgrade) Closed() bool { return !e.ClosedAt.IsZero() }
 
 // LastActivity is the latest time the proof could have settled: its last
 // submit, or when it was saved if no submit is recorded.
@@ -163,7 +173,8 @@ func (s *PendingStore) save(entries []PendingUpgrade) error {
 	return os.Rename(tmpName, s.Path)
 }
 
-// ForKey returns the entries saved for a key fingerprint, oldest first.
+// ForKey returns the open (not closed) entries saved for a key fingerprint,
+// oldest first.
 func (s *PendingStore) ForKey(fingerprint string) ([]PendingUpgrade, error) {
 	all, err := s.load()
 	if err != nil {
@@ -171,7 +182,7 @@ func (s *PendingStore) ForKey(fingerprint string) ([]PendingUpgrade, error) {
 	}
 	var out []PendingUpgrade
 	for _, e := range all {
-		if e.KeyFingerprint == fingerprint {
+		if e.KeyFingerprint == fingerprint && !e.Closed() {
 			out = append(out, e)
 		}
 	}
@@ -179,7 +190,7 @@ func (s *PendingStore) ForKey(fingerprint string) ([]PendingUpgrade, error) {
 }
 
 // ForChallenge returns the entries saved for a challenge id under any key
-// fingerprint, oldest first. The server scopes a challenge to the key it was
+// fingerprint, closed ones included, oldest first. The server scopes a challenge to the key it was
 // issued to, so a challenge id it serves again belongs to the same key even
 // when the fingerprint differs (e.g. the host was spelled another way).
 func (s *PendingStore) ForChallenge(challengeID string) ([]PendingUpgrade, error) {
@@ -237,6 +248,32 @@ func (s *PendingStore) Delete(fingerprint, challengeID string) error {
 	}
 	if len(kept) == len(all) {
 		return nil
+	}
+	return s.save(kept)
+}
+
+// closedRetention is how long a closed entry is kept as a record that its
+// challenge was paid. Challenges live minutes, and a payment settles at most
+// a day after its challenge expires, so a week outlasts any re-serve.
+const closedRetention = 7 * 24 * time.Hour
+
+// Close marks the entry for a key and challenge as refused for good (see
+// PendingUpgrade.ClosedAt) and drops closed entries past closedRetention.
+func (s *PendingStore) Close(fingerprint, challengeID, reason string, now time.Time) error {
+	all, err := s.load()
+	if err != nil {
+		return err
+	}
+	kept := all[:0]
+	for _, e := range all {
+		if e.KeyFingerprint == fingerprint && e.ChallengeID == challengeID && !e.Closed() {
+			e.ClosedAt = now.UTC()
+			e.ClosedReason = reason
+		}
+		if e.Closed() && now.Sub(e.ClosedAt) > closedRetention {
+			continue
+		}
+		kept = append(kept, e)
 	}
 	return s.save(kept)
 }

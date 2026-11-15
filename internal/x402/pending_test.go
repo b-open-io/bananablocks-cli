@@ -1,9 +1,11 @@
 package x402
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -243,5 +245,88 @@ func TestPendingLastActivity(t *testing.T) {
 	e.LastSubmitAt = e.CreatedAt.Add(-time.Hour)
 	if !e.LastActivity().Equal(e.CreatedAt) {
 		t.Fatal("a submit time before the save time is ignored")
+	}
+}
+
+func TestPendingStoreCloseKeepsChallengeRecord(t *testing.T) {
+	s := &PendingStore{Path: filepath.Join(t.TempDir(), "p.json")}
+	now := time.Now()
+	e := PendingUpgrade{KeyFingerprint: "fp", ChallengeID: "c1", Proof: "p", Txid: "t"}
+	if err := s.Put(e); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close("fp", "c1", "payment insufficient", now); err != nil {
+		t.Fatal(err)
+	}
+	if open, _ := s.ForKey("fp"); len(open) != 0 {
+		t.Fatal("a closed entry must not be returned as open")
+	}
+	same, _ := s.ForChallenge("c1")
+	if len(same) != 1 || !same[0].Closed() || same[0].ClosedReason != "payment insufficient" {
+		t.Fatalf("closed entry must still record its challenge: %+v", same)
+	}
+	// c1 has no known expiry: it is never pruned, however old.
+	if err := s.Put(PendingUpgrade{KeyFingerprint: "fp", ChallengeID: "c2", Proof: "p", ExpiresAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	later := now.Add(closedRetention + time.Hour)
+	if err := s.Close("fp", "c2", "x", later); err != nil {
+		t.Fatal(err)
+	}
+	if same, _ := s.ForChallenge("c1"); len(same) != 1 {
+		t.Fatal("a closed record with unknown expiry must be kept")
+	}
+	// c2 closed at `later`, past its expiry + retention: pruned on the next Close.
+	if err := s.Put(PendingUpgrade{KeyFingerprint: "fp", ChallengeID: "c3", Proof: "p"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close("fp", "c3", "x", later); err != nil {
+		t.Fatal(err)
+	}
+	if same, _ := s.ForChallenge("c2"); len(same) != 0 {
+		t.Fatal("a closed record well past its challenge's expiry should be pruned")
+	}
+	// A long-lived challenge closed long ago but not yet expired is kept.
+	if err := s.Put(PendingUpgrade{KeyFingerprint: "fp", ChallengeID: "c4", Proof: "p", ExpiresAt: now.Add(30 * 24 * time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close("fp", "c4", "x", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close("fp", "c3", "x", now.Add(20*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if same, _ := s.ForChallenge("c4"); len(same) != 1 {
+		t.Fatal("a closed record must outlive its open challenge")
+	}
+}
+
+// Concurrent writers never lose each other's entries.
+func TestPendingStoreConcurrentMutations(t *testing.T) {
+	s := &PendingStore{Path: filepath.Join(t.TempDir(), "p.json")}
+	const n = 40
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			id := fmt.Sprintf("c%d", i)
+			if err := s.Put(PendingUpgrade{KeyFingerprint: "fp", ChallengeID: id, Proof: "p"}); err != nil {
+				t.Error(err)
+			}
+			if i%2 == 0 {
+				if err := s.Close("fp", id, "x", time.Now()); err != nil {
+					t.Error(err)
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	all, err := s.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != n {
+		t.Fatalf("lost updates: %d of %d entries survived", len(all), n)
 	}
 }

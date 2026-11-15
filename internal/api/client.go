@@ -78,7 +78,12 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 		return resp, nil
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		// A body cut off mid-read is a transport failure, not an answer:
+		// judging the error from a truncated body would misread it.
+		return nil, fmt.Errorf("reading the HTTP %d response body: %w", resp.StatusCode, err)
+	}
 	apiErr := &Error{Status: resp.StatusCode, Header: resp.Header, Body: raw}
 	var e struct {
 		Error string `json:"error"`

@@ -81,6 +81,13 @@ cat tx.hex | bb broadcast -        # stdin
 bb broadcast tx1.hex tx2.hex       # batch via the multi endpoint
 ```
 
+Several transactions are sent in order, split into batches the server admits
+for your caller (anonymous callers get small batches); `bb` waits out the
+broadcast rate limit between them. The command exits non-zero unless every
+transaction is `accepted` — a pending status such as `QUEUED` is printed but
+not counted as accepted. If a batch fails upstream (502/503), some of it may
+already be on the network: resubmit the same hex rather than rebuilding.
+
 ### Live events
 
 ```sh
@@ -172,14 +179,27 @@ new challenge id; a second payment for the same challenge is not credited.
 id that already has a saved proof, even one saved under another spelling of
 the host or key.
 While a saved proof is unsettled, the rate-limit offer below does not pay
-either; it points you at `bb key upgrade`.
+either; it points you at `bb key upgrade`. Only one paying run per store may
+be active at a time; a second one exits at once.
 
 `bb` removes the saved entry when the upgrade settles, and when the server
-says the proof can never settle (422 rejected by broadcast, 409 payment txid
-already used, 410 expired with no payment the network holds, 404 `challenge
-not found`, 400/402). Any other 404, such as a bare `404 page not found` from
-a server where the upgrade route is not enabled, keeps the entry. If the server
-says **challenge already consumed**, an earlier submit most likely settled and
+answers 404 `challenge not found`. A 422 (rejected by broadcast) is
+resubmitted up to three times and then kept saved for a rerun, since it is not
+always final; so is a 409 "key is already on a tier at or above this
+challenge", which a later resubmit can reconcile. When the server says the
+proof can never settle (409 payment request closed / payment already refused,
+400/402, or a 410 once the day after the challenge's expiry has passed — an
+earlier 410 keeps the proof, since a late-accepted payment still settles),
+`bb` stops resubmitting it and
+marks it **closed**: it no longer blocks new upgrades, but its challenge stays
+recorded as paid until a week after the challenge expires, so if the server re-serves that same open
+challenge `bb` refuses to pay it again (only one payment ever settles a
+challenge). Check the payment transaction's status before you reuse its
+inputs. Any other 404, such as a bare `404 page not found` from
+a server where the upgrade route is not enabled, keeps the entry, and a proof
+is never carried across a redirect.
+If the server says **challenge already consumed** or **payment txid already
+used**, an earlier submit most likely settled and
 its response was lost: `bb` reads the key's tier from `/api/v1/key/usage` and
 reports success when the key is at or above the purchased tier and the proof
 was last submitted less than an hour earlier. Below that tier within the hour,

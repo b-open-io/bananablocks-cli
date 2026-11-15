@@ -8,6 +8,7 @@ require (
 	github.com/bsv-blockchain/go-sdk v1.2.24
 	github.com/gorilla/websocket v1.5.3
 	github.com/spf13/cobra v1.10.2
+	golang.org/x/sys v0.45.0
 )
 
 require (

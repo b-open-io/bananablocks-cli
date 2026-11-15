@@ -143,11 +143,13 @@ func normalizeHost(h string) string {
 	return h
 }
 
+// apiKey resolves the API key, trimmed as the server trims it, so every use
+// (auth header, proof-store scope) sees one canonical spelling.
 func apiKey() string {
-	if flagAPIKey != "" {
-		return flagAPIKey
+	if k := strings.TrimSpace(flagAPIKey); k != "" {
+		return k
 	}
-	return os.Getenv("BB_API_KEY")
+	return strings.TrimSpace(os.Getenv("BB_API_KEY"))
 }
 
 // client builds the API client from global flags.

@@ -59,7 +59,10 @@ func DefaultStateDir() (string, error) {
 
 // NewProofStore returns the store for host + apiKey under stateDir.
 func NewProofStore(stateDir, host, apiKey string) *ProofStore {
-	sum := sha256.Sum256([]byte(strings.ToLower(host) + "\x00" + apiKey))
+	// The server trims the key before authenticating it, so equivalent
+	// spellings must share one store (and one lock).
+	host = strings.ToLower(strings.TrimRight(strings.TrimSpace(host), "/"))
+	sum := sha256.Sum256([]byte(host + "\x00" + strings.TrimSpace(apiKey)))
 	return &ProofStore{Dir: filepath.Join(stateDir, "x402-proofs", hex.EncodeToString(sum[:12]))}
 }
 
@@ -129,10 +132,15 @@ func (s *ProofStore) Archive(challengeID, txid, reason string) error {
 	cur.ArchivedAt = time.Now().UTC()
 	cur.ArchiveReason = reason
 	dst := filepath.Join(s.archiveDir(), challengeKey(challengeID)+"-"+safeName(txid)+".json")
+	// The archive entry is durable before the pending copy goes, so a crash
+	// in between leaves the payment recorded in at least one place.
 	if err := writeJSONAtomic(s.archiveDir(), dst, cur); err != nil {
 		return err
 	}
-	return os.Remove(s.Path(challengeID))
+	if err := os.Remove(s.Path(challengeID)); err != nil {
+		return err
+	}
+	return syncDir(s.Dir)
 }
 
 // Paid returns a pending or archived proof for challengeID, or nil when that
@@ -199,8 +207,29 @@ func readProof(path string) (*SavedProof, error) {
 	return &p, nil
 }
 
+// mkdirAllDurable creates dir and makes each newly created entry durable in
+// its parent.
+func mkdirAllDurable(dir string) error {
+	if _, err := os.Stat(dir); err == nil {
+		return nil
+	}
+	parent := filepath.Dir(dir)
+	if parent != dir {
+		if err := mkdirAllDurable(parent); err != nil {
+			return err
+		}
+	}
+	if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	return syncDir(parent)
+}
+
+// writeJSONAtomic writes v to dst via a synced temp file and rename, then
+// syncs the directory so the new name survives a power loss: a proof is only
+// reported saved once a crash can no longer lose it.
 func writeJSONAtomic(dir, dst string, v any) error {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := mkdirAllDurable(dir); err != nil {
 		return err
 	}
 	raw, err := json.MarshalIndent(v, "", "  ")
@@ -226,7 +255,10 @@ func writeJSONAtomic(dir, dst string, v any) error {
 	if werr != nil {
 		return werr
 	}
-	return os.Rename(tmp.Name(), dst)
+	if err := os.Rename(tmp.Name(), dst); err != nil {
+		return err
+	}
+	return syncDir(dir)
 }
 
 func safeName(s string) string {

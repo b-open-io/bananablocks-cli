@@ -255,7 +255,10 @@ func terminalProofError(errw io.Writer, store *x402.ProofStore, sp *x402.SavedPr
 		}
 		return fmt.Errorf("%s (payment %s): if the network later accepts this payment it can still settle until %s; the proof stays saved at %s, so rerun `bb key upgrade` later to resubmit it rather than paying again. Check the transaction's status before you reuse its inputs",
 			msg, sp.Txid, until, store.Path(sp.ChallengeID))
-	case status == http.StatusNotFound:
+	case status == http.StatusNotFound && strings.Contains(lower, "challenge not found"):
+		// Only the protocol's own answer means the server has no such
+		// challenge; a routing 404 (x402 temporarily disabled) keeps the
+		// proof pending for a later resubmit.
 		drop("server: " + msg)
 		return fmt.Errorf("%s (payment %s): the server does not know this challenge for this API key; check the transaction's status before you reuse its inputs", msg, sp.Txid)
 	case status == http.StatusPaymentRequired:

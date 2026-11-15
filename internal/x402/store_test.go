@@ -60,3 +60,12 @@ func TestStoreLockExclusive(t *testing.T) {
 	}
 	u2()
 }
+
+func TestStoreKeySpellingsShareScope(t *testing.T) {
+	dir := t.TempDir()
+	a := NewProofStore(dir, "https://H.example/", " bb_live_x\n")
+	b := NewProofStore(dir, "https://h.example", "bb_live_x")
+	if a.Dir != b.Dir {
+		t.Fatalf("equivalent host/key spellings must share a store: %s vs %s", a.Dir, b.Dir)
+	}
+}

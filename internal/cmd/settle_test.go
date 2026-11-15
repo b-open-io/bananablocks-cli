@@ -172,6 +172,8 @@ func TestSettleProofTerminalAnswers(t *testing.T) {
 		{"closed", 409, `{"error":"payment request closed: a payment to it was refused and is recorded for a refund or a manual credit; request a new one"}`, false, "can never settle"},
 		{"refused", 409, `{"error":"payment already refused and recorded for a refund or a manual credit"}`, false, "can never settle"},
 		{"not-upgrade", 409, `{"error":"key is already on a tier at or above this challenge"}`, true, "no tier was granted"},
+		{"not-found", 404, `{"error":"challenge not found"}`, false, "does not know this challenge"},
+		{"routing-404", 404, `404 page not found`, true, "Do NOT pay again"},
 		{"expired-in-grace", 410, `{"error":"challenge expired; request a new one"}`, true, "can still settle"},
 		{"underpaid", 402, `{"error":"payment insufficient","challenge":{"challenge_id":"ch-1"}}`, true, "Do NOT pay the challenge again"},
 	}

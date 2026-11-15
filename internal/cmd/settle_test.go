@@ -370,3 +370,26 @@ func TestSettleProofRefusesOtherHost(t *testing.T) {
 		t.Fatal("proof must stay pending")
 	}
 }
+
+// TestSettleProofDoesNotFollowRedirects: a redirect must not carry the proof
+// elsewhere, and its target cannot retire the pending proof.
+func TestSettleProofDoesNotFollowRedirects(t *testing.T) {
+	noSleep(t)
+	other := newScriptedProofServer(t, proofAnswer{http.StatusNotFound, `{"error":"challenge not found"}`, ""})
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.srv.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	defer redirector.Close()
+	c, store, sp := savedFixture(t, redirector.URL)
+
+	_, err := settleProof(context.Background(), c, io.Discard, store, sp, time.Hour)
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if len(other.proofs) != 0 {
+		t.Fatal("the proof followed a redirect")
+	}
+	if left, _ := store.List(); len(left) != 1 {
+		t.Fatal("a redirect must not retire the pending proof")
+	}
+}

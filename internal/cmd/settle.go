@@ -170,7 +170,15 @@ func postProof(ctx context.Context, c *api.Client, sp *x402.SavedProof) (int, ht
 		return 0, nil, nil, err
 	}
 	req.Header.Set("X402-Proof", sp.ProofHeader)
-	resp, err := c.Do(req)
+	// Never follow a redirect with a proof: it would carry the signed payment
+	// (and the API key) to whatever the Location names, and let that answer
+	// drive settlement. A 3xx comes back as a non-retryable answer that keeps
+	// the proof pending.
+	nc := *c
+	hc := *c.HTTP
+	hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	nc.HTTP = &hc
+	resp, err := nc.Do(req)
 	if err != nil {
 		var apiErr *api.Error
 		if errors.As(err, &apiErr) {

@@ -548,6 +548,13 @@ func settleProof(ctx context.Context, c *api.Client, errw io.Writer, store *x402
 				// record against it.
 				forgetPending(errw, store, e)
 				return nil, upgradeError(apiErr, e)
+			case apiErr.Status == http.StatusGone && withinSettleGrace(e):
+				// An early 410 (ARC does not report the payment yet) closes
+				// nothing on the server: if the network accepts it later it
+				// still settles up to a day after the challenge expired. Keep
+				// the proof resumable until then.
+				return nil, fmt.Errorf("challenge %s has expired and payment %s is not accepted by the network yet; it can still settle until %s, so it stays saved — %s",
+					e.ChallengeID, e.Txid, settleGraceEnd(e).Format(time.RFC3339), resumeHint(store))
 			case proofCannotSettle(apiErr):
 				// Stop resubmitting, but keep the challenge recorded as paid
 				// so a re-served copy of it is never paid again.
@@ -600,6 +607,26 @@ func forgetPending(errw io.Writer, store *x402.PendingStore, e *x402.PendingUpgr
 	if err := store.Delete(e.KeyFingerprint, e.ChallengeID); err != nil {
 		fmt.Fprintf(errw, "warning: could not remove resolved payment %s from %s: %v\n", e.Txid, store.Path, err)
 	}
+}
+
+// settleGrace is how long after its challenge's expires_at the server still
+// settles a payment the network accepts late.
+const settleGrace = 24 * time.Hour
+
+// unknownExpiryGrace bounds an entry saved without the challenge's expiry
+// (by an older bb): challenges live minutes, so a week from saving covers any
+// realistic expiry plus settleGrace.
+const unknownExpiryGrace = 7 * 24 * time.Hour
+
+func settleGraceEnd(e *x402.PendingUpgrade) time.Time {
+	if !e.ExpiresAt.IsZero() {
+		return e.ExpiresAt.Add(settleGrace)
+	}
+	return e.CreatedAt.Add(unknownExpiryGrace)
+}
+
+func withinSettleGrace(e *x402.PendingUpgrade) bool {
+	return nowFn().Before(settleGraceEnd(e))
 }
 
 // closePending marks a refused entry closed (see PendingUpgrade.ClosedAt).
@@ -793,7 +820,7 @@ func upgradeError(apiErr *api.Error, e *x402.PendingUpgrade) error {
 		// several 409s AFTER broadcasting it.
 		return fmt.Errorf("upgrade refused: %s; %s", apiErr.Message, checkInputs)
 	case http.StatusGone:
-		return fmt.Errorf("challenge expired (payment %s): if the network accepted the payment it is recorded for a refund or a manual credit by the operator. Rerun `bb key upgrade` for a new challenge; %s", e.Txid, checkInputs)
+		return fmt.Errorf("challenge expired and its settlement window has closed (payment %s): if the network accepted the payment, ask the operator about a refund or a manual credit. Rerun `bb key upgrade` for a new challenge; %s", e.Txid, checkInputs)
 	case http.StatusUnprocessableEntity:
 		return fmt.Errorf("the server's broadcast of payment %s kept failing (%s): ARC rejected it or could not be reached, and it may still be accepted later. %s", e.Txid, apiErr.Message, checkInputs)
 	default:

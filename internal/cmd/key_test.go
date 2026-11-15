@@ -915,7 +915,8 @@ func TestUpgradeTerminalAndTransientAnswers(t *testing.T) {
 		{"409 request closed", proofReply{status: http.StatusConflict, body: `{"error":"payment request closed: a payment to it was refused and is recorded for a refund or a manual credit; request a new one"}`}, "can never settle", false, 0},
 		{"400 malformed", proofReply{status: http.StatusBadRequest, body: `{"error":"malformed payment proof"}`}, "malformed", false, 0},
 		{"402 insufficient", proofReply{status: http.StatusPaymentRequired, body: `{"error":"payment insufficient"}`}, "insufficient", false, 0},
-		{"410 expired", proofReply{status: http.StatusGone, body: `{"error":"challenge expired; request a new one"}`}, "expired", false, 0},
+		// Within a day of expires_at a 410 may still settle later: kept.
+		{"410 early", proofReply{status: http.StatusGone, body: `{"error":"challenge expired; request a new one"}`}, "can still settle", true, 0},
 		// A 5xx says nothing about the proof: it is resubmitted every 10s
 		// (no Retry-After) for the whole 1m --wait, at 0s, 10s, ... 60s.
 		{"500", proofReply{status: http.StatusInternalServerError, body: `{"error":"upgrade failed"}`}, "rerun `bb key upgrade`", true, 7},
@@ -1833,5 +1834,60 @@ func TestUpgradeTruncatedConflictIsTransient(t *testing.T) {
 	}
 	if len(proofs) != 2 || proofs[0] != proofs[1] {
 		t.Fatalf("want the same proof resubmitted once, got %d submits", len(proofs))
+	}
+}
+
+// An early 410 keeps the proof; once the settlement window has closed a 410
+// closes it, and an accepted payment in between resumes with the same proof.
+func TestUpgrade410SettlementWindow(t *testing.T) {
+	store := useTempStore(t)
+	fakeClock(t)
+	builds := countBuilds(t)
+	f := &fakeUpgradeServer{t: t, ch: testChallenge("ch-410-1")}
+	f.setReplies(
+		proofReply{status: http.StatusGone, body: `{"error":"challenge expired; request a new one"}`},
+		proofReply{status: http.StatusOK},
+	)
+	srv := f.start()
+	exp := nowFn().Add(-time.Hour)
+	if err := store.Put(x402.PendingUpgrade{
+		KeyFingerprint: x402.KeyFingerprint(srv.URL, "bb_live_test"), Host: srv.URL, ChallengeID: "ch-410-1",
+		Tier: "pro", Txid: "aa" + strings.Repeat("0", 62), Proof: "saved-proof", PayURL: x402.UpgradePath,
+		CreatedAt: exp.Add(-time.Minute), ExpiresAt: exp,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := runUpgrade(t, context.Background(), srv.URL, time.Minute); err == nil || !strings.Contains(err.Error(), "can still settle") {
+		t.Fatalf("early 410: %v", err)
+	}
+	if len(savedFor(t, store, srv.URL)) != 1 {
+		t.Fatal("an early 410 must keep the proof open")
+	}
+	if _, _, err := runUpgrade(t, context.Background(), srv.URL, time.Minute); err != nil {
+		t.Fatalf("later acceptance should settle the same proof: %v", err)
+	}
+	proofs, _ := f.snapshot()
+	if len(proofs) != 2 || proofs[0] != proofs[1] || *builds != 0 {
+		t.Fatalf("want the saved proof resubmitted and nothing built: %d submits, %d builds", len(proofs), *builds)
+	}
+
+	// Past the window, a 410 closes the entry.
+	f.mu.Lock()
+	f.proofs = nil
+	f.mu.Unlock()
+	f.setReplies(proofReply{status: http.StatusGone, body: `{"error":"challenge expired; request a new one"}`})
+	old := nowFn().Add(-48 * time.Hour)
+	if err := store.Put(x402.PendingUpgrade{
+		KeyFingerprint: x402.KeyFingerprint(srv.URL, "bb_live_test"), Host: srv.URL, ChallengeID: "ch-410-2",
+		Tier: "pro", Txid: "bb" + strings.Repeat("0", 62), Proof: "old-proof", PayURL: x402.UpgradePath,
+		CreatedAt: old, ExpiresAt: old,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := runUpgrade(t, context.Background(), srv.URL, time.Minute); err == nil || !strings.Contains(err.Error(), "window has closed") {
+		t.Fatalf("late 410: %v", err)
+	}
+	if len(savedFor(t, store, srv.URL)) != 0 {
+		t.Fatal("a 410 past the window must close the proof")
 	}
 }

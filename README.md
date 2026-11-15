@@ -188,7 +188,9 @@ resubmitted up to three times and then kept saved for a rerun, since it is not
 always final; so is a 409 "key is already on a tier at or above this
 challenge", which a later resubmit can reconcile. When the server says the
 proof can never settle (409 payment request closed / payment already refused,
-410 expired, 400/402), `bb` stops resubmitting it and
+400/402, or a 410 once the day after the challenge's expiry has passed — an
+earlier 410 keeps the proof, since a late-accepted payment still settles),
+`bb` stops resubmitting it and
 marks it **closed**: it no longer blocks new upgrades, but its challenge stays
 recorded as paid until a week after the challenge expires, so if the server re-serves that same open
 challenge `bb` refuses to pay it again (only one payment ever settles a

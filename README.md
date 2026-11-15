@@ -190,7 +190,7 @@ challenge", which a later resubmit can reconcile. When the server says the
 proof can never settle (409 payment request closed / payment already refused,
 410 expired, 400/402), `bb` stops resubmitting it and
 marks it **closed**: it no longer blocks new upgrades, but its challenge stays
-recorded as paid for a week, so if the server re-serves that same open
+recorded as paid until a week after the challenge expires, so if the server re-serves that same open
 challenge `bb` refuses to pay it again (only one payment ever settles a
 challenge). Check the payment transaction's status before you reuse its
 inputs. Any other 404, such as a bare `404 page not found` from

@@ -265,15 +265,39 @@ func TestPendingStoreCloseKeepsChallengeRecord(t *testing.T) {
 	if len(same) != 1 || !same[0].Closed() || same[0].ClosedReason != "payment insufficient" {
 		t.Fatalf("closed entry must still record its challenge: %+v", same)
 	}
-	// Past the retention it is pruned on the next Close.
-	if err := s.Put(PendingUpgrade{KeyFingerprint: "fp", ChallengeID: "c2", Proof: "p"}); err != nil {
+	// c1 has no known expiry: it is never pruned, however old.
+	if err := s.Put(PendingUpgrade{KeyFingerprint: "fp", ChallengeID: "c2", Proof: "p", ExpiresAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Close("fp", "c2", "x", now.Add(closedRetention+time.Hour)); err != nil {
+	later := now.Add(closedRetention + time.Hour)
+	if err := s.Close("fp", "c2", "x", later); err != nil {
 		t.Fatal(err)
 	}
-	if same, _ := s.ForChallenge("c1"); len(same) != 0 {
-		t.Fatal("an expired closed record should be pruned")
+	if same, _ := s.ForChallenge("c1"); len(same) != 1 {
+		t.Fatal("a closed record with unknown expiry must be kept")
+	}
+	// c2 closed at `later`, past its expiry + retention: pruned on the next Close.
+	if err := s.Put(PendingUpgrade{KeyFingerprint: "fp", ChallengeID: "c3", Proof: "p"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close("fp", "c3", "x", later); err != nil {
+		t.Fatal(err)
+	}
+	if same, _ := s.ForChallenge("c2"); len(same) != 0 {
+		t.Fatal("a closed record well past its challenge's expiry should be pruned")
+	}
+	// A long-lived challenge closed long ago but not yet expired is kept.
+	if err := s.Put(PendingUpgrade{KeyFingerprint: "fp", ChallengeID: "c4", Proof: "p", ExpiresAt: now.Add(30 * 24 * time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close("fp", "c4", "x", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close("fp", "c3", "x", now.Add(20*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if same, _ := s.ForChallenge("c4"); len(same) != 1 {
+		t.Fatal("a closed record must outlive its open challenge")
 	}
 }
 

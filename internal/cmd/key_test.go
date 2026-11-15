@@ -911,6 +911,7 @@ func TestUpgradeTerminalAndTransientAnswers(t *testing.T) {
 		{"409 txid used", proofReply{status: http.StatusConflict, body: `{"error":"payment txid already used"}`}, "already consumed", true, 0},
 		// May reconcile or settle later: kept saved, not closed.
 		{"409 already on tier", proofReply{status: http.StatusConflict, body: `{"error":"key is already on a tier at or above this challenge"}`}, "No tier was granted", true, 0},
+		{"409 unrecognized", proofReply{status: http.StatusConflict, body: `{"error":"something new"}`}, "something new", true, 0},
 		{"409 request closed", proofReply{status: http.StatusConflict, body: `{"error":"payment request closed: a payment to it was refused and is recorded for a refund or a manual credit; request a new one"}`}, "can never settle", false, 0},
 		{"400 malformed", proofReply{status: http.StatusBadRequest, body: `{"error":"malformed payment proof"}`}, "malformed", false, 0},
 		{"402 insufficient", proofReply{status: http.StatusPaymentRequired, body: `{"error":"payment insufficient"}`}, "insufficient", false, 0},
@@ -1798,5 +1799,39 @@ func TestUpgradeRunLockIsExclusive(t *testing.T) {
 	}
 	if *builds != 0 {
 		t.Fatal("a locked-out run built a payment")
+	}
+}
+
+// A 409 whose body is cut off mid-read is a transport failure, not a
+// terminal answer: the same proof is resubmitted and settles.
+func TestUpgradeTruncatedConflictIsTransient(t *testing.T) {
+	store := useTempStore(t)
+	fakeClock(t)
+	var n int
+	var proofs []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X402-Proof") == "" {
+			http.NotFound(w, r)
+			return
+		}
+		proofs = append(proofs, r.Header.Get("X402-Proof"))
+		n++
+		if n == 1 {
+			w.Header().Set("Content-Length", "500")
+			w.WriteHeader(http.StatusConflict)
+			io.WriteString(w, `{"error":"key is alr`)
+			conn, _, _ := w.(http.Hijacker).Hijack()
+			conn.Close()
+			return
+		}
+		json.NewEncoder(w).Encode(x402.UpgradeResult{Tier: "pro", Txid: "aa" + strings.Repeat("0", 62), TierExpiresAt: time.Now().Add(time.Hour)})
+	}))
+	defer srv.Close()
+	seedSaved(t, store, srv.URL, "ch-trunc-1", "saved-proof")
+	if _, errOut, err := runUpgrade(t, context.Background(), srv.URL, time.Minute); err != nil {
+		t.Fatalf("%v\n%s", err, errOut)
+	}
+	if len(proofs) != 2 || proofs[0] != proofs[1] {
+		t.Fatalf("want the same proof resubmitted once, got %d submits", len(proofs))
 	}
 }

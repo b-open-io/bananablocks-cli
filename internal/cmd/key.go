@@ -371,6 +371,7 @@ func savePending(store *x402.PendingStore, fp, host string, ch *x402.Challenge, 
 		Proof:          hdr,
 		PayURL:         ch.PayURL,
 		CreatedAt:      nowFn().UTC(),
+		ExpiresAt:      ch.ExpiresAt,
 	}
 	if err := store.Put(e); err != nil {
 		return nil, fmt.Errorf("saving payment %s to %s before submitting it failed, so nothing was submitted or paid: %w", txid, store.Path, err)
@@ -638,7 +639,10 @@ func proofCannotSettle(apiErr *api.Error) bool {
 	case http.StatusNotFound:
 		return isChallengeNotFound(apiErr)
 	case http.StatusConflict:
-		return !strings.Contains(strings.ToLower(apiErr.Message), "already on a tier")
+		// Only the documented terminal conflicts; any other 409 (including
+		// one whose message is unrecognized) keeps the proof resumable.
+		msg := strings.ToLower(apiErr.Message)
+		return strings.Contains(msg, "payment request closed") || strings.Contains(msg, "payment already refused")
 	case http.StatusBadRequest, http.StatusPaymentRequired, http.StatusGone:
 		return true
 	}

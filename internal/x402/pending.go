@@ -31,6 +31,9 @@ type PendingUpgrade struct {
 	Proof          string    `json:"proof"` // the X402-Proof header value, resubmitted verbatim
 	PayURL         string    `json:"pay_url"`
 	CreatedAt      time.Time `json:"created_at"`
+	// ExpiresAt is the challenge's expires_at, when known. It bounds how long
+	// a closed entry must be kept (see closedRetention).
+	ExpiresAt time.Time `json:"expires_at,omitempty"`
 	// LastSubmitAt is when the proof was last sent to the server. A settle can
 	// only happen on a submit, so this bounds how recently it could have
 	// settled.
@@ -303,10 +306,16 @@ func (s *PendingStore) lock(path string, nonBlocking bool) (func(), error) {
 	return func() { _ = f.Close() }, nil
 }
 
-// closedRetention is how long a closed entry is kept as a record that its
-// challenge was paid. Challenges live minutes, and a payment settles at most
-// a day after its challenge expires, so a week outlasts any re-serve.
+// closedRetention is how long past its challenge's expires_at a closed entry
+// is kept as the record that its challenge was paid. The server never
+// re-serves an expired challenge, and settles a payment at most a day after
+// expiry, so a week past expiry is ample. An entry whose expiry is unknown is
+// kept: dropping it could let a still-open challenge be paid again.
 const closedRetention = 7 * 24 * time.Hour
+
+func (e PendingUpgrade) closedExpired(now time.Time) bool {
+	return e.Closed() && !e.ExpiresAt.IsZero() && now.Sub(e.ExpiresAt) > closedRetention
+}
 
 // Close marks the entry for a key and challenge as refused for good (see
 // PendingUpgrade.ClosedAt) and drops closed entries past closedRetention.
@@ -318,7 +327,7 @@ func (s *PendingStore) Close(fingerprint, challengeID, reason string, now time.T
 				e.ClosedAt = now.UTC()
 				e.ClosedReason = reason
 			}
-			if e.Closed() && now.Sub(e.ClosedAt) > closedRetention {
+			if e.closedExpired(now) {
 				continue
 			}
 			kept = append(kept, e)

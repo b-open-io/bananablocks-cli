@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -61,9 +63,31 @@ func DefaultStateDir() (string, error) {
 func NewProofStore(stateDir, host, apiKey string) *ProofStore {
 	// The server trims the key before authenticating it, so equivalent
 	// spellings must share one store (and one lock).
-	host = strings.ToLower(strings.TrimRight(strings.TrimSpace(host), "/"))
-	sum := sha256.Sum256([]byte(host + "\x00" + strings.TrimSpace(apiKey)))
+	sum := sha256.Sum256([]byte(canonicalOrigin(host) + "\x00" + strings.TrimSpace(apiKey)))
 	return &ProofStore{Dir: filepath.Join(stateDir, "x402-proofs", hex.EncodeToString(sum[:12]))}
+}
+
+// canonicalOrigin reduces a host URL to scheme://host[:port] in lower case,
+// dropping a default port and any path, so every spelling of one server
+// shares one store and one lock.
+func canonicalOrigin(raw string) string {
+	raw = strings.TrimSpace(raw)
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return strings.ToLower(strings.TrimRight(raw, "/"))
+	}
+	scheme := strings.ToLower(u.Scheme)
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	port := u.Port()
+	if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
+		port = ""
+	}
+	if port != "" {
+		host = net.JoinHostPort(host, port)
+	} else if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	return scheme + "://" + host
 }
 
 // ErrLocked is returned by Lock when another process holds the store.
@@ -73,7 +97,7 @@ var ErrLocked = errors.New("another `bb key upgrade` (or inline upgrade) is runn
 // pending set that can lead to a payment must hold it until the payment's
 // proof is saved and settled, so two runs cannot pay the same challenge.
 func (s *ProofStore) Lock() (unlock func(), err error) {
-	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
+	if err := mkdirAllDurable(s.Dir); err != nil {
 		return nil, err
 	}
 	f, err := os.OpenFile(filepath.Join(s.Dir, ".lock"), os.O_CREATE|os.O_RDWR, 0o600)
@@ -207,22 +231,25 @@ func readProof(path string) (*SavedProof, error) {
 	return &p, nil
 }
 
-// mkdirAllDurable creates dir and makes each newly created entry durable in
-// its parent.
+// mkdirAllDurable creates dir and then flushes every directory from dir up
+// to the filesystem root, so the whole path (including entries left by an
+// earlier, interrupted run) survives a power loss.
 func mkdirAllDurable(dir string) error {
-	if _, err := os.Stat(dir); err == nil {
-		return nil
-	}
-	parent := filepath.Dir(dir)
-	if parent != dir {
-		if err := mkdirAllDurable(parent); err != nil {
-			return err
-		}
-	}
-	if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	return syncDir(parent)
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+	for d := abs; ; d = filepath.Dir(d) {
+		if err := syncDir(d); err != nil {
+			return err
+		}
+		if filepath.Dir(d) == d {
+			return nil
+		}
+	}
 }
 
 // writeJSONAtomic writes v to dst via a synced temp file and rename, then
@@ -255,7 +282,7 @@ func writeJSONAtomic(dir, dst string, v any) error {
 	if werr != nil {
 		return werr
 	}
-	if err := os.Rename(tmp.Name(), dst); err != nil {
+	if err := renameDurable(tmp.Name(), dst); err != nil {
 		return err
 	}
 	return syncDir(dir)

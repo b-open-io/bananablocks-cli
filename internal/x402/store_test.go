@@ -64,8 +64,13 @@ func TestStoreLockExclusive(t *testing.T) {
 func TestStoreKeySpellingsShareScope(t *testing.T) {
 	dir := t.TempDir()
 	a := NewProofStore(dir, "https://H.example/", " bb_live_x\n")
-	b := NewProofStore(dir, "https://h.example", "bb_live_x")
-	if a.Dir != b.Dir {
-		t.Fatalf("equivalent host/key spellings must share a store: %s vs %s", a.Dir, b.Dir)
+	for _, h := range []string{"https://h.example", "https://h.example:443", "HTTPS://h.example.:443/api"} {
+		b := NewProofStore(dir, h, "bb_live_x")
+		if a.Dir != b.Dir {
+			t.Fatalf("%q must share the store of https://H.example/", h)
+		}
+	}
+	if NewProofStore(dir, "https://h.example:8443", "bb_live_x").Dir == a.Dir {
+		t.Fatal("a non-default port is a different server")
 	}
 }

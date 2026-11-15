@@ -16,3 +16,6 @@ func syncDir(dir string) error {
 	}
 	return serr
 }
+
+// renameDurable renames; the caller then syncs the directory.
+func renameDurable(from, to string) error { return os.Rename(from, to) }

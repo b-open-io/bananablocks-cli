@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -171,7 +172,7 @@ func TestSettleProofTerminalAnswers(t *testing.T) {
 		{"closed", 409, `{"error":"payment request closed: a payment to it was refused and is recorded for a refund or a manual credit; request a new one"}`, false, "can never settle"},
 		{"refused", 409, `{"error":"payment already refused and recorded for a refund or a manual credit"}`, false, "can never settle"},
 		{"not-upgrade", 409, `{"error":"key is already on a tier at or above this challenge"}`, true, "no tier was granted"},
-		{"expired", 410, `{"error":"challenge expired; request a new one"}`, false, "refund"},
+		{"expired-in-grace", 410, `{"error":"challenge expired; request a new one"}`, true, "can still settle"},
 		{"underpaid", 402, `{"error":"payment insufficient","challenge":{"challenge_id":"ch-1"}}`, true, "Do NOT pay the challenge again"},
 	}
 	for _, tc := range cases {
@@ -281,5 +282,70 @@ func TestRetryAfter(t *testing.T) {
 	h.Set("Retry-After", "junk")
 	if got := retryAfter(h, 2*time.Second); got != 2*time.Second {
 		t.Fatalf("junk: %s", got)
+	}
+}
+
+// TestSettleProof410AfterGraceArchives: once the settlement window has closed
+// a 410 is final and the proof leaves the pending set.
+func TestSettleProof410AfterGraceArchives(t *testing.T) {
+	noSleep(t)
+	s := newScriptedProofServer(t, proofAnswer{http.StatusGone, `{"error":"challenge expired; request a new one"}`, ""})
+	c, store, sp := savedFixture(t, s.srv.URL)
+	sp.ExpiresAt = time.Now().Add(-25 * time.Hour)
+	if err := store.Save(sp); err != nil {
+		t.Fatal(err)
+	}
+	_, err := settleProof(context.Background(), c, io.Discard, store, sp, time.Hour)
+	if err == nil || !strings.Contains(err.Error(), "window has closed") {
+		t.Fatalf("got %v", err)
+	}
+	if left, _ := store.List(); len(left) != 0 {
+		t.Fatal("proof should be archived after the grace window")
+	}
+	if prev, _ := store.Paid(sp.ChallengeID); prev == nil {
+		t.Fatal("an archived challenge must still count as paid")
+	}
+}
+
+// TestEnsureUnpaidRefusesReusedChallenge is the --new-payment guard: after a
+// proof is abandoned, the server re-serving the same open challenge must not
+// be paid again.
+func TestEnsureUnpaidRefusesReusedChallenge(t *testing.T) {
+	_, store, sp := savedFixture(t, "https://example.invalid")
+	if err := store.Archive(sp.ChallengeID, sp.Txid, "abandoned"); err != nil {
+		t.Fatal(err)
+	}
+	if left, _ := store.List(); len(left) != 0 {
+		t.Fatal("archived proof still pending")
+	}
+	err := ensureUnpaid(store, &x402.Challenge{ChallengeID: sp.ChallengeID, ExpiresAt: time.Now().Add(time.Minute)})
+	if err == nil || !strings.Contains(err.Error(), "never credited") {
+		t.Fatalf("got %v", err)
+	}
+	if ensureUnpaid(store, &x402.Challenge{ChallengeID: "fresh"}) != nil {
+		t.Fatal("a fresh challenge must be payable")
+	}
+}
+
+// TestUpgradeIsExclusive: a second run for the same key cannot start while
+// the first holds the store.
+func TestUpgradeIsExclusive(t *testing.T) {
+	t.Setenv("BB_STATE_DIR", t.TempDir())
+	oldHost, oldKey := flagHost, flagAPIKey
+	flagHost, flagAPIKey = "https://example.invalid", "bb_live_test"
+	defer func() { flagHost, flagAPIKey = oldHost, oldKey }()
+
+	store, err := proofStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := store.Lock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	err = payChallenge(context.Background(), io.Discard, testWIF, &x402.Challenge{ChallengeID: "x", ExpiresAt: time.Now().Add(time.Minute)})
+	if !errors.Is(err, x402.ErrLocked) {
+		t.Fatalf("want ErrLocked, got %v", err)
 	}
 }

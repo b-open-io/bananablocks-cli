@@ -128,9 +128,11 @@ payment flow:
 
 A second payment to the same challenge is never credited, so `bb` never pays
 over an unresolved proof: a later `bb key upgrade` resubmits any saved proof
-instead of paying again. Proofs live under `$BB_STATE_DIR` (default
-`<user config dir>/bananablocks-cli`). `--new-payment` discards them — use it
-only after confirming their transactions were not mined.
+instead of paying again, and a challenge that was ever paid is never paid
+again. Only one run per API key may pay at a time. Proofs live under
+`$BB_STATE_DIR` (default `<user config dir>/bananablocks-cli`).
+`--new-payment` abandons pending proofs (an abandoned payment that is later
+mined is not credited) — check their transactions' status first.
 
 The funding key is a WIF private key. Prefer `--wif-file`, which keeps the key
 out of shell history and process environments:

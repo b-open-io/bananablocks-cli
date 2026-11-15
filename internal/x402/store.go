@@ -28,18 +28,24 @@ type SavedProof struct {
 	SubmitPath  string    `json:"submit_path"`
 	ExpiresAt   time.Time `json:"expires_at"`
 	SavedAt     time.Time `json:"saved_at"`
+
+	// Set when the proof leaves the pending set.
+	ArchivedAt    time.Time `json:"archived_at,omitempty"`
+	ArchiveReason string    `json:"archive_reason,omitempty"`
 }
 
-// ProofStore keeps SavedProofs on disk, one file per challenge, in a
-// directory scoped to a (host, API key) pair. The key itself is never
-// written: the directory name is a hash of it.
+// ProofStore keeps SavedProofs on disk in a directory scoped to a
+// (host, API key) pair; the key itself is never written, only a hash of it.
+// Pending proofs sit at the top level, one per challenge. A proof that
+// settles, can never settle, or is abandoned moves to archive/, which also
+// remembers every challenge that has ever been paid so none is paid twice.
 type ProofStore struct {
 	Dir string
 }
 
-// DefaultStateDir is where pending proofs live: $BB_STATE_DIR when set,
-// otherwise the user config dir (durable, unlike a cache dir that the OS may
-// clear while a payment is still pending).
+// DefaultStateDir is where proofs live: $BB_STATE_DIR when set, otherwise
+// the user config dir (durable, unlike a cache dir that the OS may clear
+// while a payment is still pending).
 func DefaultStateDir() (string, error) {
 	if d := os.Getenv("BB_STATE_DIR"); d != "" {
 		return d, nil
@@ -57,25 +63,151 @@ func NewProofStore(stateDir, host, apiKey string) *ProofStore {
 	return &ProofStore{Dir: filepath.Join(stateDir, "x402-proofs", hex.EncodeToString(sum[:12]))}
 }
 
-func (s *ProofStore) path(challengeID string) string {
-	sum := sha256.Sum256([]byte(challengeID))
-	return filepath.Join(s.Dir, hex.EncodeToString(sum[:16])+".json")
+// ErrLocked is returned by Lock when another process holds the store.
+var ErrLocked = errors.New("another `bb key upgrade` (or inline upgrade) is running for this API key; wait for it to finish")
+
+// Lock takes an exclusive, process-wide lock on the store. Every read of the
+// pending set that can lead to a payment must hold it until the payment's
+// proof is saved and settled, so two runs cannot pay the same challenge.
+func (s *ProofStore) Lock() (unlock func(), err error) {
+	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(s.Dir, ".lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := tryLock(f); err != nil {
+		_ = f.Close()
+		return nil, ErrLocked
+	}
+	return func() { _ = f.Close() }, nil
 }
 
-// Save writes p durably (temp file + fsync + rename) with owner-only
-// permissions. It must succeed before the proof is first submitted.
+func challengeKey(challengeID string) string {
+	sum := sha256.Sum256([]byte(challengeID))
+	return hex.EncodeToString(sum[:16])
+}
+
+func (s *ProofStore) archiveDir() string { return filepath.Join(s.Dir, "archive") }
+
+// Path reports where the pending proof for challengeID is (or would be).
+func (s *ProofStore) Path(challengeID string) string {
+	return filepath.Join(s.Dir, challengeKey(challengeID)+".json")
+}
+
+// Save writes p as the pending proof for its challenge, durably (temp file +
+// fsync + rename) with owner-only permissions. It refuses a challenge that
+// already has a pending or archived payment with a different transaction, so
+// a proof is never overwritten and no challenge is funded twice.
 func (s *ProofStore) Save(p *SavedProof) error {
 	if p.ChallengeID == "" {
 		return errors.New("saved proof has no challenge_id")
 	}
-	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
+	if prev, err := s.Paid(p.ChallengeID); err != nil {
 		return err
+	} else if prev != nil && prev.Txid != p.Txid {
+		return fmt.Errorf("challenge %s already has a payment (%s); refusing to record a second one", p.ChallengeID, prev.Txid)
 	}
-	raw, err := json.MarshalIndent(p, "", "  ")
+	return writeJSONAtomic(s.Dir, s.Path(p.ChallengeID), p)
+}
+
+// Archive moves the pending proof for challengeID out of the pending set,
+// but only when it is still the proof for txid: a pending proof that another
+// payment replaced is left alone.
+func (s *ProofStore) Archive(challengeID, txid, reason string) error {
+	cur, err := readProof(s.Path(challengeID))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(s.Dir, ".proof-*")
+	if cur.Txid != txid {
+		return nil
+	}
+	cur.ArchivedAt = time.Now().UTC()
+	cur.ArchiveReason = reason
+	dst := filepath.Join(s.archiveDir(), challengeKey(challengeID)+"-"+safeName(txid)+".json")
+	if err := writeJSONAtomic(s.archiveDir(), dst, cur); err != nil {
+		return err
+	}
+	return os.Remove(s.Path(challengeID))
+}
+
+// Paid returns a pending or archived proof for challengeID, or nil when that
+// challenge has never been paid from this store.
+func (s *ProofStore) Paid(challengeID string) (*SavedProof, error) {
+	p, err := readProof(s.Path(challengeID))
+	if err == nil {
+		return p, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	matches, err := filepath.Glob(filepath.Join(s.archiveDir(), challengeKey(challengeID)+"-*.json"))
+	if err != nil {
+		return nil, err
+	}
+	for _, m := range matches {
+		p, err := readProof(m)
+		if err != nil {
+			return nil, err
+		}
+		if p.ChallengeID == challengeID {
+			return p, nil
+		}
+	}
+	return nil, nil
+}
+
+// List returns every pending proof, newest first. A missing directory is an
+// empty list; an unreadable or corrupt file is an error, so a damaged proof
+// can never be silently skipped and paid over.
+func (s *ProofStore) List() ([]*SavedProof, error) {
+	entries, err := os.ReadDir(s.Dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var out []*SavedProof
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		p, err := readProof(filepath.Join(s.Dir, e.Name()))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].SavedAt.After(out[j].SavedAt) })
+	return out, nil
+}
+
+func readProof(path string) (*SavedProof, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var p SavedProof
+	if err := json.Unmarshal(raw, &p); err != nil || p.ChallengeID == "" || p.ProofHeader == "" {
+		return nil, fmt.Errorf("saved payment proof %s is unreadable; inspect it before paying again", path)
+	}
+	return &p, nil
+}
+
+func writeJSONAtomic(dir, dst string, v any) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	raw, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".proof-*")
 	if err != nil {
 		return err
 	}
@@ -94,48 +226,21 @@ func (s *ProofStore) Save(p *SavedProof) error {
 	if werr != nil {
 		return werr
 	}
-	return os.Rename(tmp.Name(), s.path(p.ChallengeID))
+	return os.Rename(tmp.Name(), dst)
 }
 
-// Path reports where the proof for challengeID is (or would be) stored.
-func (s *ProofStore) Path(challengeID string) string { return s.path(challengeID) }
-
-// Delete removes the proof for challengeID; a missing file is not an error.
-func (s *ProofStore) Delete(challengeID string) error {
-	err := os.Remove(s.path(challengeID))
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	return err
-}
-
-// List returns every saved proof, newest first. A missing directory is an
-// empty list; an unreadable or corrupt file is an error, so a damaged proof
-// can never be silently skipped and paid over.
-func (s *ProofStore) List() ([]*SavedProof, error) {
-	entries, err := os.ReadDir(s.Dir)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	var out []*SavedProof
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-			continue
+func safeName(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+			b.WriteRune(r)
 		}
-		full := filepath.Join(s.Dir, e.Name())
-		raw, err := os.ReadFile(full)
-		if err != nil {
-			return nil, err
+		if b.Len() >= 64 {
+			break
 		}
-		var p SavedProof
-		if err := json.Unmarshal(raw, &p); err != nil || p.ChallengeID == "" || p.ProofHeader == "" {
-			return nil, fmt.Errorf("saved payment proof %s is unreadable; inspect it before paying again", full)
-		}
-		out = append(out, &p)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].SavedAt.After(out[j].SavedAt) })
-	return out, nil
+	if b.Len() == 0 {
+		return "unknown"
+	}
+	return b.String()
 }

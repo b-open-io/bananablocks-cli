@@ -128,8 +128,8 @@ func settleProof(ctx context.Context, c *api.Client, errw io.Writer, store *x402
 				// proof so a rerun resubmits it rather than paying again.
 				return nil, fmt.Errorf("%w; %s", perr, keepProofAdvice(store, sp))
 			}
-			if derr := store.Delete(sp.ChallengeID); derr != nil {
-				fmt.Fprintf(errw, "warning: settled, but could not remove the saved proof %s: %v\n", store.Path(sp.ChallengeID), derr)
+			if aerr := store.Archive(sp.ChallengeID, sp.Txid, "settled"); aerr != nil {
+				fmt.Fprintf(errw, "warning: settled, but could not archive the saved proof %s: %v\n", store.Path(sp.ChallengeID), aerr)
 			}
 			return res, nil
 		case status == http.StatusUnprocessableEntity:
@@ -217,31 +217,46 @@ func pendingProofError(store *x402.ProofStore, sp *x402.SavedProof, reason strin
 		sp.Txid, sp.ChallengeID, reason, keepProofAdvice(store, sp))
 }
 
-// terminalProofError maps an answer that resubmitting cannot change. Proofs
-// that can never settle are removed; the rest stay saved so the payment is
-// never re-made over them.
+// settleGrace is how long after a challenge's expires_at the server still
+// settles an accepted payment to it.
+const settleGrace = 24 * time.Hour
+
+// terminalProofError maps an answer that automatic retries cannot change.
+// Proofs that can never settle are archived; the rest stay pending so a later
+// run resubmits them instead of paying again.
 func terminalProofError(errw io.Writer, store *x402.ProofStore, sp *x402.SavedProof, status int, msg string) error {
-	drop := func() {
-		if err := store.Delete(sp.ChallengeID); err != nil {
-			fmt.Fprintf(errw, "warning: could not remove the saved proof %s: %v\n", store.Path(sp.ChallengeID), err)
+	drop := func(reason string) {
+		if err := store.Archive(sp.ChallengeID, sp.Txid, reason); err != nil {
+			fmt.Fprintf(errw, "warning: could not archive the saved proof %s: %v\n", store.Path(sp.ChallengeID), err)
 		}
 	}
 	lower := strings.ToLower(msg)
 	switch {
 	case status == http.StatusConflict && (strings.Contains(lower, "challenge already consumed") || strings.Contains(lower, "payment txid already used")):
-		drop()
+		drop("server: " + msg)
 		return fmt.Errorf("%s (payment %s): this proof will not be retried. It may already have settled even if no confirmation arrived; check `bb key usage` before paying again", msg, sp.Txid)
 	case status == http.StatusConflict && (strings.Contains(lower, "payment request closed") || strings.Contains(lower, "payment already refused")):
-		drop()
+		drop("server: " + msg)
 		return fmt.Errorf("%s (payment %s): resubmitting it can never settle. Run `bb key upgrade` for a new challenge if you still want the upgrade; check the transaction's status before you reuse its inputs, and contact the operator if it is mined", msg, sp.Txid)
 	case status == http.StatusConflict && strings.Contains(lower, "already on a tier"):
 		return fmt.Errorf("%s (payment %s): no tier was granted. Check `bb key usage`, and ask the operator to check payment and refusal records before expecting a credit or refund. The proof stays saved at %s so a later `bb key upgrade` can resubmit it to reconcile; do not make another payment",
 			msg, sp.Txid, store.Path(sp.ChallengeID))
 	case status == http.StatusGone:
-		drop()
-		return fmt.Errorf("%s (payment %s): if the network accepted the payment it is recorded for a refund or a manual credit by the operator. Check the transaction's status before you reuse its inputs", msg, sp.Txid)
+		// A 410 is not proof the payment is lost: within the grace window an
+		// expired challenge's payment can still settle once the network
+		// accepts it, so the proof stays pending until that window closes.
+		if !sp.ExpiresAt.IsZero() && time.Now().After(sp.ExpiresAt.Add(settleGrace)) {
+			drop("server: " + msg)
+			return fmt.Errorf("%s (payment %s): the settlement window has closed. If the network accepted this payment, ask the operator about a refund or manual credit. Check the transaction's status before you reuse its inputs", msg, sp.Txid)
+		}
+		until := "24 hours after the challenge expired"
+		if !sp.ExpiresAt.IsZero() {
+			until = sp.ExpiresAt.Add(settleGrace).Format(time.RFC3339)
+		}
+		return fmt.Errorf("%s (payment %s): if the network later accepts this payment it can still settle until %s; the proof stays saved at %s, so rerun `bb key upgrade` later to resubmit it rather than paying again. Check the transaction's status before you reuse its inputs",
+			msg, sp.Txid, until, store.Path(sp.ChallengeID))
 	case status == http.StatusNotFound:
-		drop()
+		drop("server: " + msg)
 		return fmt.Errorf("%s (payment %s): the server does not know this challenge for this API key; check the transaction's status before you reuse its inputs", msg, sp.Txid)
 	case status == http.StatusPaymentRequired:
 		return fmt.Errorf("%s (payment %s): the server did not accept this payment for the challenge. Do NOT pay the challenge again; a second payment is not credited. Check the transaction's status and contact the operator. The proof stays saved at %s (--new-payment discards it)",

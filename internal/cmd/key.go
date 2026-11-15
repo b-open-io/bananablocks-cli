@@ -65,8 +65,10 @@ it is first submitted, and bb resubmits that SAME proof while the server
 reports the payment as pending, up to --wait. Once a proof has been
 submitted its payment may be on the network, and a second payment to the
 same challenge is never credited, so a later run resubmits any saved proof
-instead of paying again. --new-payment discards saved proofs; use it only
-after confirming their transactions were not mined.
+instead of paying again, and a challenge that was ever paid is never paid
+again. Only one run per API key may be paying at a time. --new-payment
+abandons saved proofs (an abandoned payment that is later mined is not
+credited); use it only after checking their transactions' status.
 
 The funding key is a WIF private key. Prefer --wif-file, which keeps the key
 out of shell history and inherited environments; --wif and the BB_WIF
@@ -92,6 +94,13 @@ Use --dry-run to fetch and inspect the challenge without paying.`,
 		if err != nil {
 			return err
 		}
+		// Hold the store from the pending check until this run's payment is
+		// saved and settled, so concurrent runs cannot pay the same challenge.
+		unlock, err := store.Lock()
+		if err != nil {
+			return err
+		}
+		defer unlock()
 		saved, err := store.List()
 		if err != nil {
 			return err
@@ -102,8 +111,8 @@ Use --dry-run to fetch and inspect the challenge without paying.`,
 				fmt.Fprintf(errw, "%d saved payment proof(s) from an earlier run are pending; `bb key upgrade` will resubmit them instead of paying again\n", len(saved))
 			case upgradeNewPayment:
 				for _, sp := range saved {
-					fmt.Fprintf(errw, "warning: discarding the saved proof for payment %s (challenge %s); a mined copy of it is NOT credited by a new payment\n", sp.Txid, sp.ChallengeID)
-					if err := store.Delete(sp.ChallengeID); err != nil {
+					fmt.Fprintf(errw, "warning: abandoning the saved proof for payment %s (challenge %s); if it is mined it is not credited, and its challenge will not be paid again\n", sp.Txid, sp.ChallengeID)
+					if err := store.Archive(sp.ChallengeID, sp.Txid, "abandoned (--new-payment)"); err != nil {
 						return err
 					}
 				}
@@ -141,6 +150,9 @@ Use --dry-run to fetch and inspect the challenge without paying.`,
 		}
 
 		if err := ensureNotExpired(ch); err != nil {
+			return err
+		}
+		if err := ensureUnpaid(store, ch); err != nil {
 			return err
 		}
 
@@ -367,8 +379,16 @@ func payChallenge(ctx context.Context, errw io.Writer, wif string, ch *x402.Chal
 	if err != nil {
 		return err
 	}
+	unlock, err := store.Lock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	saved, err := store.List()
 	if err != nil {
+		return err
+	}
+	if err := ensureUnpaid(store, ch); err != nil {
 		return err
 	}
 	if len(saved) > 0 {
@@ -391,6 +411,24 @@ func payChallenge(ctx context.Context, errw io.Writer, wif string, ch *x402.Chal
 	fmt.Fprintf(errw, "upgrade settled: tier %q until %s (payment txid %s) — rerun your command\n",
 		res.Tier, res.TierExpiresAt.Format(time.RFC3339), res.Txid)
 	return nil
+}
+
+// ensureUnpaid refuses a challenge this store has already funded. The server
+// re-serves an open challenge rather than replacing it, and only one payment
+// settles a challenge, so paying it again would never be credited.
+func ensureUnpaid(store *x402.ProofStore, ch *x402.Challenge) error {
+	prev, err := store.Paid(ch.ChallengeID)
+	if err != nil {
+		return err
+	}
+	if prev == nil {
+		return nil
+	}
+	when := "it expires"
+	if !ch.ExpiresAt.IsZero() {
+		when = ch.ExpiresAt.Format(time.RFC3339)
+	}
+	return fmt.Errorf("the server re-served challenge %s, which already has a payment (%s); a second payment is never credited. Rerun after %s to get a new challenge", ch.ChallengeID, prev.Txid, when)
 }
 
 // payAndSettle builds and signs a payment for ch, saves its proof, and only
@@ -434,7 +472,7 @@ func init() {
 	f.Uint64Var(&upgradeFeeRate, "fee-rate", 1, "miner fee rate in sat/kB")
 	f.BoolVar(&upgradeTestnet, "testnet", false, "derive the funding address for testnet")
 	f.DurationVar(&upgradeWait, "wait", 2*time.Minute, "how long to keep resubmitting a pending payment proof before giving up (the proof stays saved)")
-	f.BoolVar(&upgradeNewPayment, "new-payment", false, "discard saved pending payment proofs and pay a new challenge (only once you have confirmed they were not mined)")
+	f.BoolVar(&upgradeNewPayment, "new-payment", false, "abandon saved pending payment proofs and pay a new challenge; a challenge that was already paid is never paid again")
 	keyCmd.AddCommand(keyUsageCmd, keyUpgradeCmd)
 	rootCmd.AddCommand(keyCmd)
 }

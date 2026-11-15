@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -135,9 +136,20 @@ func TestUpgradeFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := submitProof(context.Background(), c, got, tx.Bytes(), tx.TxID().String())
+	store := x402.NewProofStore(t.TempDir(), srv.URL, "bb_live_test")
+	sp, err := newSavedProof(c, got, tx.Bytes(), tx.TxID().String())
 	if err != nil {
 		t.Fatal(err)
+	}
+	if err := store.Save(sp); err != nil {
+		t.Fatal(err)
+	}
+	res, err := settleProof(context.Background(), c, io.Discard, store, sp, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if left, _ := store.List(); len(left) != 0 {
+		t.Fatalf("a settled proof must be removed, %d left", len(left))
 	}
 	if res.Tier != ch.Tier || res.Txid != tx.TxID().String() {
 		t.Fatalf("unexpected settle result: %+v", res)
@@ -162,24 +174,6 @@ func TestChallengeFromResponseHeaderFallback(t *testing.T) {
 	}
 	if got.ChallengeID != "hdr-only" {
 		t.Fatalf("got %+v", got)
-	}
-}
-
-// TestUpgradeErrorMapping checks the status → message taxonomy.
-func TestUpgradeErrorMapping(t *testing.T) {
-	cases := []struct {
-		status int
-		want   string
-	}{
-		{http.StatusConflict, "not broadcast"},
-		{http.StatusGone, "expired"},
-		{http.StatusUnprocessableEntity, "rejected"},
-	}
-	for _, tc := range cases {
-		err := upgradeError(&api.Error{Status: tc.status, Message: "m"})
-		if !strings.Contains(err.Error(), tc.want) {
-			t.Errorf("status %d → %q, want it to mention %q", tc.status, err, tc.want)
-		}
 	}
 }
 
@@ -231,6 +225,7 @@ func TestPayChallengeSettlesInline(t *testing.T) {
 	}
 	srv := newX402Server(t, wallet, ch)
 	defer srv.Close()
+	t.Setenv("BB_STATE_DIR", t.TempDir())
 
 	oldHost, oldKey := flagHost, flagAPIKey
 	flagHost, flagAPIKey = srv.URL, "bb_live_test"

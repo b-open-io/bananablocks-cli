@@ -81,6 +81,13 @@ cat tx.hex | bb broadcast -        # stdin
 bb broadcast tx1.hex tx2.hex       # batch via the multi endpoint
 ```
 
+Several transactions are sent in order, split into batches the server admits
+for your caller (anonymous callers get small batches); `bb` waits out the
+broadcast rate limit between them. The command exits non-zero unless every
+transaction is `accepted` — a pending status such as `QUEUED` is printed but
+not counted as accepted. If a batch fails upstream (502/503), some of it may
+already be on the network: resubmit the same hex rather than rebuilding.
+
 ### Live events
 
 ```sh
@@ -114,9 +121,16 @@ payment flow:
    per-challenge P2PKH payment address, expiring after a short TTL.
 2. `bb` builds and signs a transaction paying that address from your funding
    key's UTXOs (change returns to your address).
-3. The signed transaction is submitted back as an `X402-Proof` header. **The
-   server broadcasts it** — `bb` never does, so nothing leaves your wallet if
-   the upgrade is rejected.
+3. The signed transaction is saved to disk, then submitted back as an
+   `X402-Proof` header. **The server broadcasts it** — `bb` never does.
+4. While the server reports the payment as pending (`202`), `bb` resubmits the
+   **same** proof (up to `--wait`, default 2m).
+
+A second payment to the same challenge is never credited, so `bb` never pays
+over an unresolved proof: a later `bb key upgrade` resubmits any saved proof
+instead of paying again. Proofs live under `$BB_STATE_DIR` (default
+`<user config dir>/bananablocks-cli`). `--new-payment` discards them — use it
+only after confirming their transactions were not mined.
 
 The funding key is a WIF private key. Prefer `--wif-file`, which keeps the key
 out of shell history and process environments:

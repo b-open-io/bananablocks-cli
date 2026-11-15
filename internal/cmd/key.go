@@ -3,7 +3,6 @@ package cmd
 import (
 	"bufio"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,13 +38,15 @@ var keyUsageCmd = &cobra.Command{
 }
 
 var (
-	upgradeTier    string
-	upgradeWIF     string
-	upgradeWIFFile string
-	upgradeYes     bool
-	upgradeDryRun  bool
-	upgradeFeeRate uint64
-	upgradeTestnet bool
+	upgradeTier       string
+	upgradeWIF        string
+	upgradeWIFFile    string
+	upgradeYes        bool
+	upgradeDryRun     bool
+	upgradeFeeRate    uint64
+	upgradeTestnet    bool
+	upgradeWait       time.Duration
+	upgradeNewPayment bool
 )
 
 var keyUpgradeCmd = &cobra.Command{
@@ -57,8 +58,15 @@ var keyUpgradeCmd = &cobra.Command{
 The flow: the server answers with a 402 challenge naming a price and a
 per-challenge payment address; bb builds and signs a transaction paying it
 from the funding key's UTXOs; the signed transaction is submitted back as
-payment proof. The SERVER broadcasts the transaction — bb never does — so
-no payment leaves your wallet if the upgrade is rejected.
+payment proof. The SERVER broadcasts the transaction — bb never does.
+
+The proof is saved (under BB_STATE_DIR, default the user config dir) before
+it is first submitted, and bb resubmits that SAME proof while the server
+reports the payment as pending, up to --wait. Once a proof has been
+submitted its payment may be on the network, and a second payment to the
+same challenge is never credited, so a later run resubmits any saved proof
+instead of paying again. --new-payment discards saved proofs; use it only
+after confirming their transactions were not mined.
 
 The funding key is a WIF private key. Prefer --wif-file, which keeps the key
 out of shell history and inherited environments; --wif and the BB_WIF
@@ -78,6 +86,37 @@ Use --dry-run to fetch and inspect the challenge without paying.`,
 		}
 		c := client()
 		ctx := cmd.Context()
+		errw := cmd.ErrOrStderr()
+
+		store, err := proofStore()
+		if err != nil {
+			return err
+		}
+		saved, err := store.List()
+		if err != nil {
+			return err
+		}
+		if len(saved) > 0 {
+			switch {
+			case upgradeDryRun:
+				fmt.Fprintf(errw, "%d saved payment proof(s) from an earlier run are pending; `bb key upgrade` will resubmit them instead of paying again\n", len(saved))
+			case upgradeNewPayment:
+				for _, sp := range saved {
+					fmt.Fprintf(errw, "warning: discarding the saved proof for payment %s (challenge %s); a mined copy of it is NOT credited by a new payment\n", sp.Txid, sp.ChallengeID)
+					if err := store.Delete(sp.ChallengeID); err != nil {
+						return err
+					}
+				}
+			default:
+				// Never pay over an unresolved proof: its payment may already be
+				// broadcast, and a second payment to its challenge is not credited.
+				res, err := resubmitSaved(ctx, c, errw, store, saved, upgradeWait)
+				if err != nil {
+					return err
+				}
+				return render.JSON(cmd.OutOrStdout(), res)
+			}
+		}
 
 		ch, err := fetchChallenge(cmd, c)
 		if err != nil {
@@ -87,7 +126,6 @@ Use --dry-run to fetch and inspect the challenge without paying.`,
 			return err
 		}
 
-		errw := cmd.ErrOrStderr()
 		fmt.Fprintf(errw, "x402 challenge:\n")
 		fmt.Fprintf(errw, "  tier:      %s (%d days)\n", ch.Tier, ch.DurationDays)
 		fmt.Fprintf(errw, "  price:     %d sats\n", ch.AmountSats)
@@ -120,13 +158,7 @@ Use --dry-run to fetch and inspect the challenge without paying.`,
 			return errors.New("aborted")
 		}
 
-		tx, err := wallet.BuildPayment(ctx, c, ch, upgradeFeeRate)
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(errw, "built payment %s (%d bytes); submitting proof...\n", tx.TxID().String(), tx.Size())
-
-		res, err := submitProof(ctx, c, ch, tx.Bytes(), tx.TxID().String())
+		res, err := payAndSettle(ctx, c, errw, store, wallet, ch)
 		if err != nil {
 			return err
 		}
@@ -193,51 +225,6 @@ func ensureNotExpired(ch *x402.Challenge) error {
 	return nil
 }
 
-// submitProof POSTs the signed payment as an X402-Proof header and decodes
-// the settlement result.
-func submitProof(ctx context.Context, c *api.Client, ch *x402.Challenge, rawTx []byte, txid string) (*x402.UpgradeResult, error) {
-	hdr, err := x402.EncodeProofHeader(&x402.Proof{
-		Version:     x402.Version,
-		ChallengeID: ch.ChallengeID,
-		RawTxBase64: base64.StdEncoding.EncodeToString(rawTx),
-		Txid:        txid,
-	})
-	if err != nil {
-		return nil, err
-	}
-	req, err := c.NewRequest(ctx, http.MethodPost, submitPath(ch.PayURL, c.BaseURL), nil, "", nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("X402-Proof", hdr)
-	resp, err := c.Do(req)
-	if err != nil {
-		var apiErr *api.Error
-		if errors.As(err, &apiErr) {
-			return nil, upgradeError(apiErr)
-		}
-		return nil, err
-	}
-	defer resp.Body.Close()
-	// Bound the body like the client's JSON/Bytes paths do, rather than decoding
-	// straight from an unbounded network stream.
-	raw, err := c.ReadBody(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	var res x402.UpgradeResult
-	if err := json.Unmarshal(raw, &res); err != nil {
-		return nil, fmt.Errorf("decoding upgrade result: %w", err)
-	}
-	// A 2xx body that unmarshals cleanly but carries no settlement data (e.g. an
-	// empty object or an error payload) must not be reported as a settled
-	// upgrade — require the fields that prove settlement.
-	if res.Tier == "" && res.Txid == "" {
-		return nil, fmt.Errorf("upgrade response contained no settlement details: %s", strings.TrimSpace(string(raw)))
-	}
-	return &res, nil
-}
-
 // submitPath resolves where to POST the payment proof. The challenge's pay_url
 // takes precedence (a challenge issued off a rate-limited endpoint may name a
 // different path or carry query params), falling back to the canonical upgrade
@@ -272,26 +259,6 @@ func submitPath(payURL, baseURL string) string {
 		p += "?" + u.RawQuery
 	}
 	return p
-}
-
-// upgradeError maps the server's x402 error statuses onto actionable messages.
-func upgradeError(apiErr *api.Error) error {
-	switch apiErr.Status {
-	case http.StatusPaymentRequired:
-		if ch, err := challengeFromResponse(apiErr); err == nil {
-			return fmt.Errorf("payment insufficient: the challenge wants %d sats to %s (challenge still open — rerun to retry)",
-				ch.AmountSats, ch.PayeeDisplay())
-		}
-		return fmt.Errorf("payment insufficient: %s", apiErr.Message)
-	case http.StatusConflict:
-		return fmt.Errorf("%s (the payment tx was not broadcast by this attempt)", apiErr.Message)
-	case http.StatusGone:
-		return errors.New("challenge expired; rerun to request a fresh one")
-	case http.StatusUnprocessableEntity:
-		return fmt.Errorf("broadcast rejected the payment transaction: %s — check the funding UTXOs are unspent", apiErr.Message)
-	default:
-		return apiErr
-	}
 }
 
 // fundingWIFExplicit resolves a funding key set explicitly for this command
@@ -396,6 +363,17 @@ func payChallenge(ctx context.Context, errw io.Writer, wif string, ch *x402.Chal
 	if err := ensureNotExpired(ch); err != nil {
 		return err
 	}
+	store, err := proofStore()
+	if err != nil {
+		return err
+	}
+	saved, err := store.List()
+	if err != nil {
+		return err
+	}
+	if len(saved) > 0 {
+		return fmt.Errorf("a payment proof from an earlier run is still pending (payment %s); run `bb key upgrade` to resubmit it instead of paying again", saved[0].Txid)
+	}
 	wallet, err := x402.NewWallet(wif, !upgradeTestnet)
 	if err != nil {
 		return err
@@ -405,22 +383,33 @@ func payChallenge(ctx context.Context, errw io.Writer, wif string, ch *x402.Chal
 	if !confirmIO(os.Stdin, errw, fmt.Sprintf("Pay %d sats now to upgrade to %q?", ch.AmountSats, ch.Tier)) {
 		return errDeclined
 	}
-	// Derive from the signal-aware context so Ctrl-C cancels the in-flight
-	// UTXO fetch and proof submission, not just the process at exit.
-	ctx, cancel := context.WithTimeout(ctx, flagTimeout)
-	defer cancel()
 	c := client()
-	tx, err := wallet.BuildPayment(ctx, c, ch, upgradeFeeRate)
-	if err != nil {
-		return err
-	}
-	res, err := submitProof(ctx, c, ch, tx.Bytes(), tx.TxID().String())
+	res, err := payAndSettle(ctx, c, errw, store, wallet, ch)
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(errw, "upgrade settled: tier %q until %s (payment txid %s) — rerun your command\n",
 		res.Tier, res.TierExpiresAt.Format(time.RFC3339), res.Txid)
 	return nil
+}
+
+// payAndSettle builds and signs a payment for ch, saves its proof, and only
+// then submits it, so a payment the server may broadcast is never lost.
+func payAndSettle(ctx context.Context, c *api.Client, errw io.Writer, store *x402.ProofStore, wallet *x402.Wallet, ch *x402.Challenge) (*x402.UpgradeResult, error) {
+	tx, err := wallet.BuildPayment(ctx, c, ch, upgradeFeeRate)
+	if err != nil {
+		return nil, err
+	}
+	txid := tx.TxID().String()
+	sp, err := newSavedProof(c, ch, tx.Bytes(), txid)
+	if err != nil {
+		return nil, err
+	}
+	if err := store.Save(sp); err != nil {
+		return nil, fmt.Errorf("saving the payment proof before submitting it (nothing was paid): %w", err)
+	}
+	fmt.Fprintf(errw, "built payment %s (%d bytes); proof saved to %s; submitting...\n", txid, tx.Size(), store.Path(sp.ChallengeID))
+	return settleProof(ctx, c, errw, store, sp, upgradeWait)
 }
 
 // interactive reports whether both stdin and stderr are terminals, i.e. a
@@ -444,6 +433,8 @@ func init() {
 	f.BoolVar(&upgradeDryRun, "dry-run", false, "fetch and print the challenge without paying")
 	f.Uint64Var(&upgradeFeeRate, "fee-rate", 1, "miner fee rate in sat/kB")
 	f.BoolVar(&upgradeTestnet, "testnet", false, "derive the funding address for testnet")
+	f.DurationVar(&upgradeWait, "wait", 2*time.Minute, "how long to keep resubmitting a pending payment proof before giving up (the proof stays saved)")
+	f.BoolVar(&upgradeNewPayment, "new-payment", false, "discard saved pending payment proofs and pay a new challenge (only once you have confirmed they were not mined)")
 	keyCmd.AddCommand(keyUsageCmd, keyUpgradeCmd)
 	rootCmd.AddCommand(keyCmd)
 }

@@ -119,3 +119,15 @@ func TestStorePaidFailsClosedOnUnreadableArchive(t *testing.T) {
 		t.Fatal("an unreadable archive must fail closed")
 	}
 }
+
+func TestDefaultStateDirRejectsRelative(t *testing.T) {
+	t.Setenv("BB_STATE_DIR", ".bb-state")
+	if _, err := DefaultStateDir(); err == nil {
+		t.Fatal("a relative BB_STATE_DIR must be rejected")
+	}
+	abs := t.TempDir()
+	t.Setenv("BB_STATE_DIR", abs)
+	if d, err := DefaultStateDir(); err != nil || d != abs {
+		t.Fatalf("absolute: %q, %v", d, err)
+	}
+}

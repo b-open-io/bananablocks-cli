@@ -53,6 +53,11 @@ type ProofStore struct {
 // while a payment is still pending).
 func DefaultStateDir() (string, error) {
 	if d := os.Getenv("BB_STATE_DIR"); d != "" {
+		// A relative path would select a different store (and lock) from each
+		// working directory, hiding pending proofs from a later run.
+		if !filepath.IsAbs(d) {
+			return "", fmt.Errorf("BB_STATE_DIR must be an absolute path, got %q", d)
+		}
 		return d, nil
 	}
 	base, err := os.UserConfigDir()

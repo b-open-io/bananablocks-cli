@@ -98,7 +98,7 @@ func newSavedProof(c *api.Client, ch *x402.Challenge, rawTx []byte, txid string)
 func proofStore() (*x402.ProofStore, error) {
 	dir, err := x402.DefaultStateDir()
 	if err != nil {
-		return nil, fmt.Errorf("locating a state directory for payment proofs (set BB_STATE_DIR): %w", err)
+		return nil, fmt.Errorf("locating a state directory for payment proofs (set BB_STATE_DIR to an absolute path): %w", err)
 	}
 	return x402.NewProofStore(dir, apiKey()), nil
 }

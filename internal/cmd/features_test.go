@@ -92,7 +92,7 @@ func TestFeatureQueries(t *testing.T) {
 		{[]string{"address", addr, "--txs", "--from-height", "800000", "--limit", "50"}, "/api/v1/address/" + addr + "/txs?from_height=800000&limit=50"},
 		{[]string{"address", addr, "--txs", "--cursor", "abc"}, "/api/v1/address/" + addr + "/txs?cursor=abc"},
 		{[]string{"address", addr, "--utxos", "--page", "0", "--limit", "100"}, "/api/v1/address/" + addr + "/utxos?limit=100&page=0"},
-		{[]string{"tokens", "--page", "2", "--limit", "50"}, "/api/v1/tokens?limit=50&page=2"},
+		{[]string{"tokens", "--page", "2", "--limit", "25"}, "/api/v1/tokens?limit=25&page=2"},
 		{[]string{"token", "abc_0", "--holders", "--page", "1"}, "/api/v1/token/abc_0/holders?page=1"},
 		{[]string{"token", "abc_0", "--history", "--limit", "100"}, "/api/v1/token/abc_0/history?limit=100"},
 		{[]string{"token", "abc_0", "--funding"}, "/api/v1/token/abc_0/funding"},
@@ -134,7 +134,8 @@ func TestFeatureFlagValidation(t *testing.T) {
 		{[]string{"address", addr, "--cursor", "x"}, "--cursor applies"},
 		{[]string{"address", addr, "--txs", "-o", "f"}, "-o applies"},
 		{[]string{"address", addr, "--csv", "--txs"}, "pick at most one"},
-		{[]string{"tokens", "--limit", "15"}, "one of 10, 20, 50 or 100"},
+		{[]string{"tokens", "--limit", "101"}, "between 1 and 100"},
+		{[]string{"token", "abc_0", "--holders", "--limit", "0"}, "between 1 and 100"},
 		{[]string{"tokens", "--page", "-1"}, "cannot be negative"},
 		{[]string{"token", "abc_0", "--page", "1"}, "apply to --holders and --history"},
 		{[]string{"token", "abc_0", "--funding", "--icon"}, "pick at most one"},
@@ -308,5 +309,65 @@ func TestHealth(t *testing.T) {
 	stdout, _, err := runBB(t, rs.srv.URL, "health")
 	if err != nil || stdout != "ok\n" || rs.requests()[0] != "/health" {
 		t.Fatalf("stdout %q, %v, %v", stdout, err, rs.requests())
+	}
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, io.ErrShortWrite }
+
+// A stdout write failure fails the command instead of reporting success.
+func TestPayloadStdoutWriteFailure(t *testing.T) {
+	cmd := &cobra.Command{}
+	cmd.SetOut(failingWriter{})
+	if err := writePayloadTo(cmd, "", []byte{1, 2}, false); err == nil {
+		t.Fatal("binary to a failing stdout must error")
+	}
+	if err := writePayloadTo(cmd, "-", []byte("ab"), true); err == nil {
+		t.Fatal("text to a failing stdout must error")
+	}
+}
+
+// Writing to a file goes through a temp file, so a failure leaves an existing
+// file intact.
+func TestPayloadFileReplacedAtomically(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "x.beef")
+	if err := os.WriteFile(out, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := &cobra.Command{}
+	cmd.SetErr(io.Discard)
+	// A destination in a missing directory fails before touching anything.
+	if err := writePayloadTo(cmd, filepath.Join(dir, "missing", "x"), []byte("new"), false); err == nil {
+		t.Fatal("want an error")
+	}
+	if err := writePayloadTo(cmd, out, []byte("new"), false); err != nil {
+		t.Fatal(err)
+	}
+	if raw, _ := os.ReadFile(out); string(raw) != "new" {
+		t.Fatalf("file %q", raw)
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 {
+		t.Fatalf("temp files left behind: %v", entries)
+	}
+}
+
+// The proof's targetType survives the round trip into bb's output.
+func TestProofKeepsTargetType(t *testing.T) {
+	const txid = "0e3e2357e806b6cdb1f70b54c3a3a17b6714ee1f0e68bebb44a74b1efd512098"
+	for _, tt := range []string{"merkleRoot", "hash"} {
+		rs := newRecordingServer(t, func(w http.ResponseWriter, r *http.Request) {
+			io.WriteString(w, `{"index":0,"txOrId":"`+txid+`","targetType":"`+tt+`","target":"00","nodes":[]}`)
+		})
+		args := []string{"tx", txid, "--proof"}
+		if tt == "hash" {
+			args = append(args, "--target-type", "hash")
+		}
+		stdout, _, err := runBB(t, rs.srv.URL, args...)
+		if err != nil || !strings.Contains(stdout, `"targetType": "`+tt+`"`) {
+			t.Fatalf("%s: stdout %q, %v", tt, stdout, err)
+		}
 	}
 }

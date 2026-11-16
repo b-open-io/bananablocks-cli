@@ -258,3 +258,10 @@ func TestIndexerVerifierMissingRootInconclusive(t *testing.T) {
 		t.Fatalf("missing merkle_root should be ConfUnknown, got %v", got[0].State)
 	}
 }
+
+func TestVerifyTSCRejectsNonRootTarget(t *testing.T) {
+	_, err := VerifyTSC(context.Background(), nil, nil, strings.Repeat("ab", 32), &TSCProof{TargetType: "hash", Target: "00"})
+	if err == nil || !strings.Contains(err.Error(), "not a merkle root") {
+		t.Fatalf("got %v", err)
+	}
+}

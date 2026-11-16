@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -134,10 +135,9 @@ transaction's BEEF and verifies every BUMP in it.`,
 					// here. Warn instead of silently dropping the payload.
 					fmt.Fprintln(cmd.ErrOrStderr(), "warning: -o - is ignored with --verify; rerun without --verify to emit BEEF to stdout")
 				case txOutFile != "":
-					if err := os.WriteFile(txOutFile, raw, 0o644); err != nil {
+					if err := saveStream(cmd, bytes.NewReader(raw), txOutFile, ""); err != nil {
 						return err
 					}
-					fmt.Fprintf(cmd.ErrOrStderr(), "wrote %d bytes to %s\n", len(raw), txOutFile)
 				}
 				return verifyBeefBytes(cmd, txid, raw, truncated)
 			}
@@ -204,19 +204,23 @@ func tooLargeHint(err error, txid string) error {
 // writePayload writes raw to --output when set; otherwise to stdout, hex-
 // encoding binary payloads so they stay terminal-safe.
 func writePayload(cmd *cobra.Command, raw []byte, isText bool) error {
-	if txOutFile != "" && txOutFile != "-" {
-		if err := os.WriteFile(txOutFile, raw, 0o644); err != nil {
-			return err
-		}
-		fmt.Fprintf(cmd.ErrOrStderr(), "wrote %d bytes to %s\n", len(raw), txOutFile)
-		return nil
+	return writePayloadTo(cmd, txOutFile, raw, isText)
+}
+
+// writePayloadTo writes raw to out (replacing it only once fully written) or,
+// when out is "" or "-", to stdout — hex-encoded unless isText. A failed
+// write is an error, so a truncated export never looks successful.
+func writePayloadTo(cmd *cobra.Command, out string, raw []byte, isText bool) error {
+	if out != "" && out != "-" {
+		return saveStream(cmd, bytes.NewReader(raw), out, "")
 	}
+	var err error
 	if isText {
-		fmt.Fprintln(cmd.OutOrStdout(), strings.TrimSpace(string(raw)))
-		return nil
+		_, err = fmt.Fprintln(cmd.OutOrStdout(), strings.TrimSpace(string(raw)))
+	} else {
+		_, err = fmt.Fprintf(cmd.OutOrStdout(), "%x\n", raw)
 	}
-	fmt.Fprintf(cmd.OutOrStdout(), "%x\n", raw)
-	return nil
+	return err
 }
 
 // verifyBeefBytes runs BEEF verification, turning the no-proofs case into an

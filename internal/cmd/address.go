@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 
@@ -160,15 +159,7 @@ func addressUTXOsBEEF(cmd *cobra.Command, path string, q url.Values) error {
 			fmt.Fprintln(errw, "more UTXOs exist, but the server sent no cursor to continue from")
 		}
 	}
-	if addrOutFile != "" && addrOutFile != "-" {
-		if err := os.WriteFile(addrOutFile, raw, 0o644); err != nil {
-			return err
-		}
-		fmt.Fprintf(errw, "wrote %d bytes to %s\n", len(raw), addrOutFile)
-		return nil
-	}
-	fmt.Fprintf(cmd.OutOrStdout(), "%x\n", raw)
-	return nil
+	return writePayloadTo(cmd, addrOutFile, raw, false)
 }
 
 // addressCSV downloads the recent-history CSV, warning when the server says

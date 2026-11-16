@@ -52,7 +52,7 @@ bb address <addr> --txs --from-height 800000  # confirmed history, oldest first
 bb address <addr> --balance        # confirmed balance only
 bb address <addr> --tokens         # BSV-21 token balances
 bb address <addr> --csv -o h.csv   # 100 most recent txs as CSV
-bb tokens --limit 50 --page 1      # token list (limit 10, 20, 50 or 100)
+bb tokens --limit 50 --page 1      # token list (limit 1-100)
 bb token <tokenId>                 # detail (amounts are strings, smallest unit)
 bb token <tokenId> --holders       # token holders (--page, --limit)
 bb token <tokenId> --funding       # fee address and funding status

@@ -71,7 +71,7 @@ var statsCmd = &cobra.Command{
 				return fmt.Errorf("--%s does not apply to %q (it applies to %v)", flag, which, views)
 			}
 		}
-		q, err := offsetQuery(cmd, statsPage, statsLimit)
+		q, err := offsetQuery(cmd, richlistPageLimits, statsPage, statsLimit)
 		if err != nil {
 			return err
 		}

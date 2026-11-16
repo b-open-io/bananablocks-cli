@@ -9,22 +9,41 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// offsetLimits are the only page sizes the offset-paged endpoints (tokens,
-// holders, token history, rich list) accept; any other value silently falls
-// back to the default server-side, so bb rejects it instead.
-var offsetLimits = []int{10, 20, 50, 100}
+// pageLimits says which page sizes an offset-paged endpoint accepts. The
+// token endpoints take any limit from 1 to 100; the rich list takes only 10,
+// 20, 50 or 100 and silently falls back to its default for anything else, so
+// bb rejects such a value instead.
+type pageLimits struct {
+	allowed []int // nil = any value in 1..100
+}
+
+var (
+	tokenPageLimits    = pageLimits{}
+	richlistPageLimits = pageLimits{allowed: []int{10, 20, 50, 100}}
+)
+
+func (p pageLimits) check(limit int) error {
+	if p.allowed == nil {
+		if limit < 1 || limit > 100 {
+			return fmt.Errorf("--limit must be between 1 and 100 (got %d)", limit)
+		}
+		return nil
+	}
+	for _, l := range p.allowed {
+		if l == limit {
+			return nil
+		}
+	}
+	return fmt.Errorf("--limit must be one of 10, 20, 50 or 100 (got %d)", limit)
+}
 
 // offsetQuery validates --page/--limit for an offset-paged endpoint and
 // returns the query to send.
-func offsetQuery(cmd *cobra.Command, page, limit int) (url.Values, error) {
+func offsetQuery(cmd *cobra.Command, limits pageLimits, page, limit int) (url.Values, error) {
 	q := url.Values{}
 	if cmd.Flags().Changed("limit") {
-		ok := false
-		for _, l := range offsetLimits {
-			ok = ok || l == limit
-		}
-		if !ok {
-			return nil, fmt.Errorf("--limit must be one of 10, 20, 50 or 100 (got %d)", limit)
+		if err := limits.check(limit); err != nil {
+			return nil, err
 		}
 		q.Set("limit", strconv.Itoa(limit))
 	}
@@ -45,11 +64,11 @@ var (
 var tokensCmd = &cobra.Command{
 	Use:   "tokens",
 	Short: "List BSV-21 tokens",
-	Example: `  bb tokens --limit 50
+	Example: `  bb tokens --limit 25
   bb tokens --page 2`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		q, err := offsetQuery(cmd, tokensPage, tokensLimit)
+		q, err := offsetQuery(cmd, tokenPageLimits, tokensPage, tokensLimit)
 		if err != nil {
 			return err
 		}
@@ -74,7 +93,7 @@ var tokenCmd = &cobra.Command{
 unit (divide by 10^decimals); circulating_supply and remaining_to_mint are
 omitted, not zero, when the token's balances have never been computed.
 
-  --holders / --history  offset-paged lists (--page, --limit 10|20|50|100)
+  --holders / --history  offset-paged lists (--page, --limit 1-100)
   --funding              the token's 1sat fee address and funding status;
                          offer to pay only when "solicitable" is true
   --icon                 download the token's icon (-o file, default
@@ -118,7 +137,7 @@ omitted, not zero, when the token's balances have never been computed.
 		case tokenHistory:
 			path += "/history"
 		}
-		q, err := offsetQuery(cmd, tokenPage, tokenLimit)
+		q, err := offsetQuery(cmd, tokenPageLimits, tokenPage, tokenLimit)
 		if err != nil {
 			return err
 		}
@@ -163,14 +182,14 @@ func safeFileName(s string) string {
 }
 
 func init() {
-	tokensCmd.Flags().IntVar(&tokensLimit, "limit", 20, "page size: 10, 20, 50 or 100")
+	tokensCmd.Flags().IntVar(&tokensLimit, "limit", 20, "page size (1-100)")
 	tokensCmd.Flags().IntVar(&tokensPage, "page", 0, "zero-indexed page")
 	f := tokenCmd.Flags()
 	f.BoolVar(&tokenHolders, "holders", false, "list token holders")
 	f.BoolVar(&tokenHistory, "history", false, "list token transfer history")
 	f.BoolVar(&tokenFunding, "funding", false, "show the token's fee address and funding status")
 	f.BoolVar(&tokenIcon, "icon", false, "download the token's icon")
-	f.IntVar(&tokenLimit, "limit", 20, "page size for --holders/--history: 10, 20, 50 or 100")
+	f.IntVar(&tokenLimit, "limit", 20, "page size for --holders/--history (1-100)")
 	f.IntVar(&tokenPage, "page", 0, "zero-indexed page for --holders/--history")
 	f.StringVarP(&tokenOutFile, "output", "o", "", "output file for --icon (- for stdout)")
 	rootCmd.AddCommand(tokensCmd, tokenCmd)

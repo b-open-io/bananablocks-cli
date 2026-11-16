@@ -119,8 +119,8 @@ func init() {
 		if err := validateHost(); err != nil {
 			return err
 		}
-		if f := cmd.Flags().Lookup("output"); f != nil && f.Value.String() != "" {
-			if err := refuseStderrDestination(cmd, f.Value.String()); err != nil {
+		if f := cmd.Flags().Lookup("output"); f != nil {
+			if err := checkOutputDestination(f.Value.String()); err != nil {
 				return err
 			}
 		}

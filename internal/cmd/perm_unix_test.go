@@ -9,6 +9,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -227,43 +230,136 @@ func TestPayloadSymlinkToFIFO(t *testing.T) {
 	}
 }
 
-// A symlink alias to /dev/stdout is written through stdout, not followed to
-// (and replacing) the file stdout is redirected to.
-func TestPayloadSymlinkToStdoutAlias(t *testing.T) {
+// The kernel decides where a link with a symlinked directory followed by
+// ".." leads; bb must not reroute it by reading the path text.
+func TestDestinationSymlinkDotDot(t *testing.T) {
 	dir := t.TempDir()
-	sink := filepath.Join(dir, "sink")
-	if err := os.Symlink("/dev/stdout", sink); err != nil {
+	for _, d := range []string{"a", "b/subdir"} {
+		if err := os.MkdirAll(filepath.Join(dir, d), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink("../b/subdir", filepath.Join(dir, "a", "hop")); err != nil {
 		t.Fatal(err)
 	}
-	var out bytes.Buffer
+	if err := os.Symlink("/dev/stdout", filepath.Join(dir, "a", "result")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b", "result"), []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "a", "out")
+	if err := os.Symlink("hop/../result", out); err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
 	cmd := &cobra.Command{}
-	cmd.SetOut(&out)
+	cmd.SetOut(&stdout)
 	cmd.SetErr(io.Discard)
-	if err := writePayloadTo(cmd, sink, []byte("x"), true); err != nil {
+	if err := writePayloadTo(cmd, out, []byte("new"), true); err != nil {
 		t.Fatal(err)
 	}
-	if out.String() != "x" {
-		t.Fatalf("stdout got %q", out.String())
+	if stdout.Len() != 0 {
+		t.Fatalf("payload rerouted to stdout: %q", stdout.String())
 	}
-	if st, _ := os.Lstat(sink); st.Mode()&os.ModeSymlink == 0 {
+	if raw, _ := os.ReadFile(filepath.Join(dir, "b", "result")); string(raw) != "new" {
+		t.Fatalf("the file the kernel resolves to holds %q", raw)
+	}
+}
+
+// fakeStd stands in two temp files for stdout and stderr, so destination
+// identity can be tested whatever the test binary's own streams are.
+func fakeStd(t *testing.T) (stdout, stderr *os.File) {
+	t.Helper()
+	dir := t.TempDir()
+	var err error
+	if stdout, err = os.OpenFile(filepath.Join(dir, "stdout"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if stderr, err = os.OpenFile(filepath.Join(dir, "stderr"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := stdStreams
+	stdStreams = func() (*os.File, *os.File) { return stdout, stderr }
+	t.Cleanup(func() { stdStreams = old; stdout.Close(); stderr.Close() })
+	return stdout, stderr
+}
+
+func fdPath(f *os.File) string { return "/dev/fd/" + strconv.Itoa(int(f.Fd())) }
+
+// Anything that is stdout — a descriptor path, a symlink to one, or the very
+// file stdout is redirected to — is written through stdout, not replaced.
+func TestDestinationStdoutAliases(t *testing.T) {
+	stdout, _ := fakeStd(t)
+	link := filepath.Join(t.TempDir(), "sink")
+	if err := os.Symlink(fdPath(stdout), link); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{fdPath(stdout), link, stdout.Name()} {
+		var buf bytes.Buffer
+		cmd := &cobra.Command{}
+		cmd.SetOut(&buf)
+		cmd.SetErr(io.Discard)
+		if err := writePayloadTo(cmd, p, []byte("abc"), true); err != nil {
+			t.Fatalf("%s: %v", p, err)
+		}
+		if buf.String() != "abc" {
+			t.Fatalf("%s: stdout got %q", p, buf.String())
+		}
+	}
+	if st, _ := os.Lstat(link); st.Mode()&os.ModeSymlink == 0 {
 		t.Fatal("the alias was replaced")
 	}
 }
 
-// A symlink to /dev/stderr is refused too.
-func TestStderrSymlinkRefused(t *testing.T) {
-	sink := filepath.Join(t.TempDir(), "sink")
-	if err := os.Symlink("/dev/stderr", sink); err != nil {
+// Anything that is stderr — a descriptor path, a duplicate of it (3>&2), a
+// symlink, or the file stderr is redirected to — is refused before writing.
+func TestDestinationStderrAliasesRefused(t *testing.T) {
+	_, stderr := fakeStd(t)
+	dup, err := syscall.Dup(int(stderr.Fd()))
+	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := &cobra.Command{}
-	var errb bytes.Buffer
-	cmd.SetErr(&errb)
-	cmd.SetOut(io.Discard)
-	if err := writePayloadTo(cmd, sink, []byte("x"), false); err == nil {
-		t.Fatal("a symlink to stderr must be refused")
+	defer syscall.Close(dup)
+	link := filepath.Join(t.TempDir(), "sink")
+	if err := os.Symlink(fdPath(stderr), link); err != nil {
+		t.Fatal(err)
 	}
-	if errb.Len() != 0 {
-		t.Fatalf("payload reached stderr: %q", errb.String())
+	for _, p := range []string{fdPath(stderr), "/dev/fd/" + strconv.Itoa(dup), link, stderr.Name()} {
+		if _, err := resolveDestination(p); !errors.Is(err, errStderrDest) {
+			t.Fatalf("%s: got %v", p, err)
+		}
+	}
+	rs := newRecordingServer(t, nil)
+	if _, _, err := runBB(t, rs.srv.URL, "tx", strings.Repeat("ab", 32), "--bin", "-o", stderr.Name()); !errors.Is(err, errStderrDest) {
+		t.Fatalf("command: got %v", err)
+	}
+	if len(rs.requests()) != 0 {
+		t.Fatal("a refused destination still fetched")
+	}
+}
+
+// Another descriptor is written through itself, keeping its append mode,
+// and the caller's descriptor stays open.
+func TestDestinationOtherDescriptorAppends(t *testing.T) {
+	fakeStd(t)
+	f, err := os.OpenFile(filepath.Join(t.TempDir(), "hist"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	f.WriteString("old\n")
+	cmd := &cobra.Command{}
+	cmd.SetErr(io.Discard)
+	if err := writePayloadTo(cmd, fdPath(f), []byte("new\n"), true); err != nil {
+		t.Fatal(err)
+	}
+	runtime.GC()
+	runtime.GC()
+	if _, err := f.WriteString("more\n"); err != nil {
+		t.Fatalf("the original descriptor was closed: %v", err)
+	}
+	if raw, _ := os.ReadFile(f.Name()); string(raw) != "old\nnew\nmore\n" {
+		t.Fatalf("file %q", raw)
 	}
 }

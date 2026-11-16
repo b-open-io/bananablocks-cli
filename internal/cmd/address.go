@@ -3,6 +3,7 @@ package cmd
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"strconv"
 	"strings"
@@ -141,25 +142,42 @@ func addressUTXOsBEEF(cmd *cobra.Command, path string, q url.Values) error {
 	if err != nil {
 		return err
 	}
-	errw := cmd.ErrOrStderr()
+	// Write the payload first, then the paging and coverage notes. The
+	// headers are the only place the server reports how to continue and what
+	// it left out, so a failure to print them fails the command.
+	if err := writePayloadTo(cmd, addrOutFile, raw, false); err != nil {
+		return err
+	}
+	var notes strings.Builder
 	if p := hdr.Get("X-BEEF-Proven-UTXOs"); p != "" {
-		fmt.Fprintf(errw, "proven UTXOs: %s\n", p)
+		fmt.Fprintf(&notes, "proven UTXOs: %s\n", p)
 	}
 	if o := hdr.Get("X-BEEF-Omitted-UTXOs"); o != "" && o != "0" {
-		fmt.Fprintf(errw, "warning: %s UTXO(s) on this page are not in the BEEF (no proof yet, or their transaction exceeds 4 MiB)", o)
+		fmt.Fprintf(&notes, "warning: %s UTXO(s) on this page are not in the BEEF (no proof yet, or their transaction exceeds 4 MiB)", o)
 		if ids := hdr.Get("X-BEEF-Omitted-Txids"); ids != "" {
-			fmt.Fprintf(errw, "; fetch them with bb tx <txid> --beef: %s", strings.ReplaceAll(ids, ",", " "))
+			fmt.Fprintf(&notes, "; fetch them with bb tx <txid> --beef: %s", strings.ReplaceAll(ids, ",", " "))
 		}
-		fmt.Fprintln(errw)
+		notes.WriteString("\n")
 	}
 	if strings.EqualFold(hdr.Get("X-Has-More"), "true") {
 		if next := hdr.Get("X-Next-Cursor"); next != "" {
-			fmt.Fprintf(errw, "more UTXOs: rerun with --cursor %s\n", next)
+			fmt.Fprintf(&notes, "more UTXOs: rerun with --cursor %s\n", next)
 		} else {
-			fmt.Fprintln(errw, "more UTXOs exist, but the server sent no cursor to continue from")
+			notes.WriteString("more UTXOs exist, but the server sent no cursor to continue from\n")
 		}
 	}
-	return writePayloadTo(cmd, addrOutFile, raw, false)
+	return writeNotes(cmd, notes.String())
+}
+
+// writeNotes prints s on stderr, failing when it cannot be written.
+func writeNotes(cmd *cobra.Command, s string) error {
+	if s == "" {
+		return nil
+	}
+	if _, err := io.WriteString(cmd.ErrOrStderr(), s); err != nil {
+		return fmt.Errorf("writing paging and coverage notes to stderr: %w", err)
+	}
+	return nil
 }
 
 // addressCSV downloads the recent-history CSV, warning when the server says
@@ -170,12 +188,15 @@ func addressCSV(cmd *cobra.Command, addrSeg string) error {
 		return err
 	}
 	defer body.Close()
-	errw := cmd.ErrOrStderr()
+	var notes strings.Builder
 	if strings.EqualFold(hdr.Get("X-Truncated"), "true") {
-		fmt.Fprintln(errw, "note: only the most recent transactions are included (the file ends with a '# truncated' row)")
+		notes.WriteString("note: only the most recent transactions are included (the file ends with a '# truncated' row)\n")
 	}
 	if strings.EqualFold(hdr.Get("X-Partial"), "true") {
-		fmt.Fprintln(errw, "warning: some rows could not be fully read and have blank fields (see the '# partial' row)")
+		notes.WriteString("warning: some rows could not be fully read and have blank fields (see the '# partial' row)\n")
+	}
+	if err := writeNotes(cmd, notes.String()); err != nil {
+		return err
 	}
 	if addrOutFile == "" || addrOutFile == "-" {
 		_, err := copyOut(cmd, body)

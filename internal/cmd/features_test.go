@@ -3,13 +3,11 @@ package cmd
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -375,45 +373,6 @@ func TestProofKeepsTargetType(t *testing.T) {
 	}
 }
 
-// Descriptor paths write through the process's own descriptor (so a `>>`
-// redirect keeps appending) rather than replacing the file behind it.
-func TestDescriptorPathsUseTheDescriptor(t *testing.T) {
-	for _, p := range []string{"/dev/stdout", "/dev/fd/1", "/proc/self/fd/1", "/dev/fd/../fd/1"} {
-		var out bytes.Buffer
-		cmd := &cobra.Command{}
-		cmd.SetOut(&out)
-		cmd.SetErr(io.Discard)
-		if err := writePayloadTo(cmd, p, []byte("abc"), true); err != nil {
-			t.Fatalf("%s: %v", p, err)
-		}
-		if out.String() != "abc" {
-			t.Fatalf("%s: stdout got %q", p, out.String())
-		}
-	}
-	// An appending file descriptor keeps its contents and append mode.
-	f, err := os.OpenFile(filepath.Join(t.TempDir(), "hist"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	f.WriteString("old\n")
-	cmd := &cobra.Command{}
-	cmd.SetErr(io.Discard)
-	if err := writePayloadTo(cmd, fmt.Sprintf("/dev/fd/%d", f.Fd()), []byte("new\n"), true); err != nil {
-		t.Fatal(err)
-	}
-	raw, _ := os.ReadFile(f.Name())
-	if string(raw) != "old\nnew\n" {
-		t.Fatalf("file %q, want the export appended", raw)
-	}
-	// The caller's descriptor is still open and usable afterwards.
-	runtime.GC()
-	runtime.GC()
-	if _, err := f.WriteString("more\n"); err != nil {
-		t.Fatalf("the original descriptor was closed: %v", err)
-	}
-}
-
 // After Ctrl-C a command stuck in a blocked write is abandoned after the
 // grace period instead of hanging the process.
 func TestRunInterruptible(t *testing.T) {
@@ -439,18 +398,22 @@ func TestRunInterruptible(t *testing.T) {
 	}
 }
 
-// -o pointing at stderr is refused before anything is written, so bb's own
-// messages cannot end up inside the payload.
-func TestStderrDestinationRefused(t *testing.T) {
-	const txid = "0e3e2357e806b6cdb1f70b54c3a3a17b6714ee1f0e68bebb44a74b1efd512098"
-	rs := newRecordingServer(t, nil)
-	for _, p := range []string{"/dev/stderr", "/dev/fd/2", "/proc/self/fd/2"} {
-		_, _, err := runBB(t, rs.srv.URL, "tx", txid, "--bin", "-o", p)
-		if err == nil || !strings.Contains(err.Error(), "leads to stderr") {
-			t.Fatalf("%s: got %v", p, err)
-		}
-	}
-	if got := rs.requests(); len(got) != 0 {
-		t.Fatalf("refused destinations still fetched %v", got)
+// The BEEF paging notes are the only way to continue; failing to print them
+// fails the command.
+func TestUTXOsBEEFNotesWriteFailure(t *testing.T) {
+	const addr = "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"
+	rs := newRecordingServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Has-More", "true")
+		w.Header().Set("X-Next-Cursor", "NEXT")
+		w.Write([]byte{1})
+	})
+	resetFlags(rootCmd)
+	t.Cleanup(func() { resetFlags(rootCmd) })
+	rootCmd.SetOut(io.Discard)
+	rootCmd.SetErr(failingWriter{})
+	rootCmd.SetArgs([]string{"--host", rs.srv.URL, "address", addr, "--utxos-beef"})
+	err := rootCmd.ExecuteContext(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "paging and coverage notes") {
+		t.Fatalf("got %v", err)
 	}
 }

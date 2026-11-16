@@ -5,8 +5,6 @@ import (
 	"io"
 	"mime"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -27,7 +25,7 @@ var mediaKinds = map[string]string{
 }
 
 var mediaCmd = &cobra.Command{
-	Use:   "media <txid>:<vout>",
+	Use:   "media <txid>:<vout> | <txid> --kind bfile",
 	Short: "Download on-chain content (inscriptions, NFT renders, B:// files)",
 	Long: `Download the content embedded at a transaction output. By default the
 server's unified media endpoint is used; --kind selects a specific decoder
@@ -35,21 +33,39 @@ server's unified media endpoint is used; --kind selects a specific decoder
 
 Output goes to --output when given, otherwise to a file named
 <txid>_<vout><ext> derived from the returned Content-Type. Use --stdout to
-stream bytes to stdout instead.`,
+stream bytes to stdout instead.
+
+With --kind bfile the output index may be omitted: the server then returns
+the transaction's first B:// file, which is what a bare b://<txid> resolves
+to.`,
 	Example: `  bb media 6a8f...c1:0
   bb media 6a8f...c1:0 --kind inscription -o art.png
-  bb media 6a8f...c1:0 --stdout | file -`,
+  bb media 6a8f...c1:0 --stdout | file -
+  bb media 6a8f...c1 --kind bfile`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		txid, vout, err := parseOutpoint(args[0])
-		if err != nil {
-			return err
-		}
 		kind, ok := mediaKinds[mediaKind]
 		if !ok {
 			return fmt.Errorf("unknown --kind %q (want media, inscription, nft, or bfile)", mediaKind)
 		}
-		path := "/api/v1/tx/" + url.PathEscape(txid) + "/" + kind + "/" + strconv.Itoa(vout)
+		var path, defaultName string
+		if kind == "bfile" && !strings.Contains(args[0], ":") {
+			// A bare b://<txid>: the server finds the first B:// file, which is
+			// not always at output 0.
+			txid, err := normalizeTxID(args[0])
+			if err != nil {
+				return err
+			}
+			path = "/api/v1/tx/" + url.PathEscape(txid) + "/bfile"
+			defaultName = txid
+		} else {
+			txid, vout, err := parseOutpoint(args[0])
+			if err != nil {
+				return err
+			}
+			path = "/api/v1/tx/" + url.PathEscape(txid) + "/" + kind + "/" + strconv.Itoa(vout)
+			defaultName = fmt.Sprintf("%s_%d", txid, vout)
+		}
 		// Stream the content straight to its sink; on-chain media can be large,
 		// so it is never fully buffered in memory. streamClient omits the overall
 		// HTTP timeout, which would otherwise abort a long download mid-copy.
@@ -65,39 +81,10 @@ stream bytes to stdout instead.`,
 			_, err := io.Copy(cmd.OutOrStdout(), body)
 			return err
 		}
-		out := mediaOutFile
-		if out == "" {
-			out = fmt.Sprintf("%s_%d%s", txid, vout, extForContentType(contentType))
+		if mediaOutFile == "" {
+			return saveGenerated(cmd, body, defaultName+extForContentType(contentType), contentType)
 		}
-		// Download to a temp file in the same directory and rename into place
-		// only once the copy fully succeeds. Writing the target directly would
-		// truncate (and, on a mid-download error, delete) a pre-existing file at
-		// that path — destroying it even though the download never completed.
-		f, err := os.CreateTemp(filepath.Dir(out), ".bb-media-*")
-		if err != nil {
-			return err
-		}
-		tmp := f.Name()
-		if err := f.Chmod(0o644); err != nil {
-			_ = f.Close()
-			_ = os.Remove(tmp)
-			return err
-		}
-		n, err := io.Copy(f, body)
-		if closeErr := f.Close(); err == nil {
-			err = closeErr
-		}
-		if err != nil {
-			// Discard the partial download; the target file is untouched.
-			_ = os.Remove(tmp)
-			return err
-		}
-		if err := os.Rename(tmp, out); err != nil {
-			_ = os.Remove(tmp)
-			return err
-		}
-		fmt.Fprintf(cmd.ErrOrStderr(), "wrote %d bytes (%s) to %s\n", n, contentType, out)
-		return nil
+		return saveStream(cmd, body, mediaOutFile, contentType)
 	},
 }
 
@@ -156,7 +143,7 @@ func extForContentType(ct string) string {
 func init() {
 	f := mediaCmd.Flags()
 	f.StringVar(&mediaKind, "kind", "media", "content decoder: media, inscription, nft, or bfile")
-	f.StringVarP(&mediaOutFile, "output", "o", "", "output file (default <txid>_<vout>.<ext>)")
+	f.StringVarP(&mediaOutFile, "output", "o", "", "output file (default <txid>_<vout>.<ext>, or <txid>.<ext> for a bare bfile)")
 	f.BoolVar(&mediaStdout, "stdout", false, "write content bytes to stdout")
 	rootCmd.AddCommand(mediaCmd)
 }

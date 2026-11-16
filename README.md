@@ -39,17 +39,30 @@ make install   # → $GOBIN, versioned via ldflags
 bb block tip                       # chain tip
 bb block 800000                    # block by height or hash
 bb block 800000 --protocols        # protocol counts in the block
-bb blocks --limit 10               # recent blocks
+bb blocks --limit 10               # recent blocks (max 100)
+bb blocks --from 800000            # page backwards from a height
 bb tx <txid>                       # transaction JSON
 bb tx <txid> --hex                 # raw hex
+bb tx <txid> --bin -o tx.bin       # raw bytes (cheapest for very large txs)
 bb address <addr>                  # address summary
-bb address <addr> --utxos          # unspent outputs
-bb address <addr> --balance        # balance only
+bb address <addr> --utxos          # confirmed unspent outputs
+bb address <addr> --utxos --cursor <c>        # deep paging (--page reaches 1000)
+bb address <addr> --utxos-beef -o coins.beef  # a page of UTXOs as one BEEF with proofs
+bb address <addr> --txs --from-height 800000  # confirmed history, oldest first
+bb address <addr> --balance        # confirmed balance only
 bb address <addr> --tokens         # BSV-21 token balances
-bb tokens --limit 25               # token list
-bb token <tokenId> --holders       # token holders
-bb stats network                   # network stats (also: summary, richlist,
+bb address <addr> --csv -o h.csv   # 100 most recent txs as CSV
+bb tokens --limit 50 --page 1      # token list (limit 1-100)
+bb token <tokenId>                 # detail (amounts are strings, smallest unit)
+bb token <tokenId> --holders       # token holders (--page, --limit)
+bb token <tokenId> --funding       # fee address and funding status
+bb token <tokenId> --icon          # download the icon
+bb stats network --window 24h      # network stats (also: summary, richlist,
                                    # mempool, protocols, price, rates)
+bb stats protocols --days 30       # --days: network, protocols, price
+bb stats richlist --page 1 --limit 100
+bb status                          # node indexing / data-freshness status
+bb health                          # server health check
 bb get "blocks?limit=5"            # any API path, pretty-printed
 ```
 
@@ -104,7 +117,18 @@ One JSON event per line; reconnects automatically.
 bb media <txid>:<vout>                       # unified media endpoint
 bb media <txid>:<vout> --kind inscription    # or nft, bfile
 bb media <txid>:<vout> --stdout | jq .       # stream to stdout
+bb media <txid> --kind bfile                 # first B:// file (bare b://<txid>)
 ```
+
+### Writing to files (`-o`)
+
+`-o FILE` replaces the file atomically (a failed download never leaves a
+half-written file) and keeps an existing file's permissions. `-o -`, or any
+path that is stdout (`/dev/stdout`, a symlink to it), writes to stdout, so
+`>>` redirects keep appending; `/dev/fd/N` writes through that descriptor; a
+FIFO or device is written in place. A destination that is stderr is refused,
+since bb's messages go there. Default download names (`bb media`,
+`bb token --icon`) never follow an existing symlink.
 
 ### API key & x402 pay-to-upgrade
 

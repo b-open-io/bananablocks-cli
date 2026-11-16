@@ -29,10 +29,14 @@ import (
 // TSCProof mirrors the explorer's /api/v1/tx/{txid}/proof response. Target is
 // the block's merkle root; a node of "*" duplicates the working hash.
 type TSCProof struct {
-	Index  uint64   `json:"index"`
-	TxOrID string   `json:"txOrId"`
-	Target string   `json:"target"`
-	Nodes  []string `json:"nodes"`
+	Index  uint64 `json:"index"`
+	TxOrID string `json:"txOrId"`
+	// TargetType says what Target carries: "merkleRoot" (the explorer's
+	// default) or "hash" (the block hash). Kept so an exported proof stays
+	// self-describing: TSC consumers read a missing targetType as a hash.
+	TargetType string   `json:"targetType,omitempty"`
+	Target     string   `json:"target"`
+	Nodes      []string `json:"nodes"`
 }
 
 // Result reports one verified proof.
@@ -98,6 +102,9 @@ func VerifyTSC(ctx context.Context, c *api.Client, v RootVerifier, txid string, 
 	root, err := ComputeTSCRoot(txid, p.Index, p.Nodes)
 	if err != nil {
 		return nil, err
+	}
+	if p.TargetType != "" && p.TargetType != "merkleRoot" {
+		return nil, fmt.Errorf("proof target is a %s, not a merkle root; fetch it with targetType=merkleRoot to verify", p.TargetType)
 	}
 	res := &Result{Txid: txid, ComputedRoot: root}
 	// Compare case-insensitively: the computed root is lowercase hex but the

@@ -53,14 +53,57 @@ Configuration:
 func Execute() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
-	err := rootCmd.ExecuteContext(ctx)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "Error:", err)
-		offerUpgradeOn402(ctx, os.Stderr, err)
-	}
-	return err
+	// Error reporting (and the upgrade offer) run inside the watchdog too: a
+	// write to a stderr pipe nobody drains must not outlive Ctrl-C either.
+	return runInterruptible(ctx, func() error {
+		err := rootCmd.ExecuteContext(ctx)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			if ctx.Err() == nil {
+				offerUpgradeOn402(ctx, os.Stderr, err)
+			}
+		}
+		return err
+	}, interruptGrace,
+		// Once Ctrl-C has been seen, restore the default handler so a second
+		// one kills the process outright.
+		stop,
+		func() {
+			// The diagnostic must not delay the exit: stderr may be the same
+			// full pipe the command is stuck writing to.
+			go fmt.Fprintln(os.Stderr, "Error: interrupted")
+			time.Sleep(50 * time.Millisecond)
+			os.Exit(130)
+		})
 }
 
+// interruptGrace is how long a command may take to wind down after Ctrl-C.
+const interruptGrace = 3 * time.Second
+
+// runInterruptible runs fn and returns its error. Commands watch ctx and
+// return promptly on Ctrl-C, but a write to stdout or a pipe whose reader
+// stopped draining blocks in the kernel where no context reaches it; if fn
+// has not returned within grace of ctx ending, exit is called instead of
+// leaving the process hung.
+func runInterruptible(ctx context.Context, fn func() error, grace time.Duration, onCancel, exit func()) error {
+	errc := make(chan error, 1)
+	go func() { errc <- fn() }()
+	select {
+	case err := <-errc:
+		return err
+	case <-ctx.Done():
+	}
+	if onCancel != nil {
+		onCancel()
+	}
+	select {
+	case err := <-errc:
+		return err
+	case <-time.After(grace):
+		exit()
+		return ctx.Err()
+	}
+}
 func init() {
 	pf := rootCmd.PersistentFlags()
 	pf.StringVar(&flagHost, "host", "", "server base URL (env BB_HOST, default "+defaultHost+")")
@@ -75,6 +118,11 @@ func init() {
 		}
 		if err := validateHost(); err != nil {
 			return err
+		}
+		if f := cmd.Flags().Lookup("output"); f != nil {
+			if err := checkOutputDestination(f.Value.String()); err != nil {
+				return err
+			}
 		}
 		return validateChain()
 	}

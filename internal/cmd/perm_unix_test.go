@@ -529,3 +529,54 @@ func TestDestinationUntraceableAliasRefused(t *testing.T) {
 		t.Fatalf("plain path: %+v, %v", d, err)
 	}
 }
+
+// Only exact descriptor spellings name a descriptor; a path the kernel
+// would reject is not rewritten into one.
+func TestDescriptorPathExactSpelling(t *testing.T) {
+	for _, p := range []string{"/dev/null/../fd/3", "/dev/fd/../fd/3", "/dev/fd/3/", "/dev/fd/+3", "/proc/self/fd/-1", "/dev//stdout"} {
+		if _, ok := descriptorPath(p); ok {
+			t.Errorf("%q must not name a descriptor", p)
+		}
+	}
+	if fd, ok := descriptorPath("/dev/fd/3"); !ok || fd != 3 {
+		t.Fatal("/dev/fd/3")
+	}
+	fakeStd(t)
+	if _, err := resolveDestination("/dev/null/../fd/3"); err == nil {
+		t.Fatal("an invalid path must be rejected, not mapped to fd 3")
+	}
+}
+
+// A FIFO swapped for a regular file while bb waits for a reader is not
+// written to.
+func TestFIFOSwappedWhileWaiting(t *testing.T) {
+	fakeStd(t)
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "pipe")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("mkfifo: %v", err)
+	}
+	cmd := &cobra.Command{}
+	cmd.SetErr(io.Discard)
+	cmd.SetContext(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- writePayloadTo(cmd, fifo, []byte("payload"), true) }()
+	time.Sleep(150 * time.Millisecond)
+	if err := os.Remove(fifo); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fifo, []byte("precious"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "changed while waiting") {
+			t.Fatalf("got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no answer")
+	}
+	if raw, _ := os.ReadFile(fifo); string(raw) != "precious" {
+		t.Fatalf("replacement overwritten: %q", raw)
+	}
+}

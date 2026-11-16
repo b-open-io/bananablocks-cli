@@ -48,6 +48,7 @@ type destination struct {
 	kind destKind
 	fd   int    // destFD
 	path string // destFile: the real file to replace; destInPlace: path to open
+	info os.FileInfo
 }
 
 var errStderrDest = errors.New("leads to stderr, where bb also writes its messages; use -o - (stdout) or a file")
@@ -127,7 +128,7 @@ func resolveDestination(out string) (destination, error) {
 		return destination{kind: destFD, fd: fd}, nil
 	}
 	if !fst.Mode().IsRegular() {
-		return destination{kind: destInPlace, path: out}, nil
+		return destination{kind: destInPlace, path: out, info: fst}, nil
 	}
 	if evalErr != nil {
 		return destination{}, fmt.Errorf("-o %s: %w", out, evalErr)
@@ -193,11 +194,11 @@ func sameAs(fi os.FileInfo, f *os.File) bool {
 	return err == nil && os.SameFile(fi, st)
 }
 
-// descriptorPath reports the fd a path names: /dev/stdout (1), /dev/stderr
-// (2), /dev/fd/N and /proc/self/fd/N.
+// descriptorPath reports the fd a path names when it is spelled exactly as
+// /dev/stdout (1), /dev/stderr (2), /dev/fd/N or /proc/self/fd/N. No
+// lexical cleaning: "/dev/null/../fd/3" is an error to the kernel, not fd 3.
 func descriptorPath(out string) (int, bool) {
-	clean := filepath.Clean(out)
-	switch clean {
+	switch out {
 	case "/dev/stdout":
 		return 1, true
 	case "/dev/stderr":
@@ -205,15 +206,23 @@ func descriptorPath(out string) (int, bool) {
 	}
 	var rest string
 	switch {
-	case strings.HasPrefix(clean, "/dev/fd/"):
-		rest = strings.TrimPrefix(clean, "/dev/fd/")
-	case strings.HasPrefix(clean, "/proc/self/fd/"):
-		rest = strings.TrimPrefix(clean, "/proc/self/fd/")
+	case strings.HasPrefix(out, "/dev/fd/"):
+		rest = strings.TrimPrefix(out, "/dev/fd/")
+	case strings.HasPrefix(out, "/proc/self/fd/"):
+		rest = strings.TrimPrefix(out, "/proc/self/fd/")
 	default:
 		return 0, false
 	}
+	if rest == "" || len(rest) > 9 {
+		return 0, false
+	}
+	for _, c := range rest {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+	}
 	fd, err := strconv.Atoi(rest)
-	if err != nil || fd < 0 {
+	if err != nil {
 		return 0, false
 	}
 	return fd, true
@@ -276,7 +285,7 @@ func saveStream(cmd *cobra.Command, body io.Reader, out, contentType string) err
 			}
 		}
 	case destInPlace:
-		n, err = writeInPlace(cmd, body, d.path)
+		n, err = writeInPlace(cmd, body, d.path, d.info)
 	case destFile:
 		n, err = replaceFile(body, d.path, outputMode(d.path))
 	}
@@ -322,7 +331,7 @@ func replaceFile(body io.Reader, path string, mode os.FileMode) (int64, error) {
 // writeInPlace streams body into an existing non-regular file (a FIFO, a
 // device) without replacing it. Opening and writing honor Ctrl-C: a FIFO
 // with no reader, or one whose reader stopped draining, cannot hang bb.
-func writeInPlace(cmd *cobra.Command, body io.Reader, path string) (int64, error) {
+func writeInPlace(cmd *cobra.Command, body io.Reader, path string, want os.FileInfo) (int64, error) {
 	ctx := cmd.Context()
 	if ctx == nil {
 		ctx = context.Background()
@@ -330,6 +339,12 @@ func writeInPlace(cmd *cobra.Command, body io.Reader, path string) (int64, error
 	f, err := openForWriteCtx(ctx, path)
 	if err != nil {
 		return 0, err
+	}
+	// The path may have been swapped while bb waited for a reader: write
+	// only to the very non-regular file that was checked.
+	if got, serr := f.Stat(); serr != nil || got.Mode().IsRegular() || (want != nil && !os.SameFile(got, want)) {
+		_ = f.Close()
+		return 0, fmt.Errorf("-o %s changed while waiting to write to it; nothing was written", path)
 	}
 	stop := make(chan struct{})
 	defer close(stop)

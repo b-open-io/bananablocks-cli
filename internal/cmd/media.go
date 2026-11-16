@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -111,11 +113,28 @@ func saveStreamDepth(cmd *cobra.Command, body io.Reader, out, contentType string
 	if st, err := os.Lstat(out); err == nil {
 		switch {
 		case st.Mode()&os.ModeSymlink != 0:
-			// Only a link that resolves is followed; guessing where a
-			// dangling one points could land on an unrelated file.
+			// What the link leads to, as the kernel resolves it. This also
+			// covers descriptor magic links such as Linux /dev/stdout ->
+			// /proc/self/fd/1 -> pipe:[N], which no path walk can follow.
+			fst, err := os.Stat(out)
+			if err != nil {
+				// Dangling: guessing where it points could land on an
+				// unrelated file.
+				return fmt.Errorf("%s is a symbolic link that does not resolve (%v); pass the real destination path", out, err)
+			}
+			if fst.IsDir() {
+				return fmt.Errorf("%s is a directory", out)
+			}
+			if !fst.Mode().IsRegular() {
+				// A pipe, FIFO, terminal or device: stream through the
+				// original path.
+				return writeInPlace(cmd, body, out, contentType)
+			}
 			target, err := filepath.EvalSymlinks(out)
 			if err != nil {
-				return fmt.Errorf("%s is a symbolic link that does not resolve (%v); pass the real destination path", out, err)
+				// A regular file reachable only through a magic link:
+				// write it in place rather than guess a path.
+				return writeInPlace(cmd, body, out, contentType)
 			}
 			return saveStreamDepth(cmd, body, target, contentType, depth+1)
 		case !st.Mode().IsRegular():
@@ -219,13 +238,31 @@ func init() {
 // writeInPlace streams body into an existing non-regular file (a FIFO, a
 // device such as /dev/stdout) without replacing it.
 func writeInPlace(cmd *cobra.Command, body io.Reader, out, contentType string) error {
-	f, err := os.OpenFile(out, os.O_WRONLY, 0)
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	f, err := openForWriteCtx(ctx, out)
 	if err != nil {
 		return err
 	}
-	n, err := io.Copy(f, body)
-	if closeErr := f.Close(); err == nil {
+	// Ctrl-C cancels ctx; closing the file then unblocks a write stalled on
+	// a reader that stopped draining (pipes and FIFOs are pollable).
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = f.Close()
+		case <-stop:
+		}
+	}()
+	n, err := io.Copy(newCtxWriter(ctx, f), body)
+	if closeErr := f.Close(); err == nil && !errors.Is(closeErr, os.ErrClosed) {
 		err = closeErr
+	}
+	if ctx.Err() != nil {
+		return fmt.Errorf("writing %s: %w", out, ctx.Err())
 	}
 	if err != nil {
 		return err

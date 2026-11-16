@@ -3,11 +3,14 @@
 package cmd
 
 import (
+	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -136,5 +139,89 @@ func TestPayloadDanglingSymlinkRefused(t *testing.T) {
 	}
 	if raw, _ := os.ReadFile(unrelated); string(raw) != "keep" {
 		t.Fatalf("unrelated file overwritten: %q", raw)
+	}
+}
+
+// A FIFO with no reader does not hang the command: cancelling the context
+// (Ctrl-C) ends the wait, and a stalled write is interrupted too.
+func TestPayloadFIFOCancellable(t *testing.T) {
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "pipe")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("mkfifo: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := &cobra.Command{}
+	cmd.SetErr(io.Discard)
+	cmd.SetContext(ctx)
+	done := make(chan error, 1)
+	go func() { done <- writePayloadTo(cmd, fifo, []byte("x"), false) }()
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no-reader FIFO open did not respond to cancellation")
+	}
+
+	// A reader that opens but never drains: the write stalls once the pipe
+	// buffer fills, and cancellation must still end it.
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	cmd.SetContext(ctx2)
+	r, err := os.OpenFile(fifo, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	big := make([]byte, 4<<20)
+	go func() { done <- writePayloadTo(cmd, fifo, big, true) }()
+	time.Sleep(200 * time.Millisecond)
+	cancel2()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("stalled write: got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stalled FIFO write did not respond to cancellation")
+	}
+}
+
+// A link that resolves to a pipe (as /dev/stdout does) is streamed through,
+// not rejected or replaced.
+func TestPayloadSymlinkToFIFO(t *testing.T) {
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "pipe")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("mkfifo: %v", err)
+	}
+	link := filepath.Join(dir, "out")
+	if err := os.Symlink(fifo, link); err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan []byte, 1)
+	go func() {
+		f, err := os.Open(fifo)
+		if err != nil {
+			got <- nil
+			return
+		}
+		defer f.Close()
+		b, _ := io.ReadAll(f)
+		got <- b
+	}()
+	cmd := &cobra.Command{}
+	cmd.SetErr(io.Discard)
+	if err := writePayloadTo(cmd, link, []byte("hi"), true); err != nil {
+		t.Fatal(err)
+	}
+	if b := <-got; string(b) != "hi" {
+		t.Fatalf("reader got %q", b)
+	}
+	if st, _ := os.Lstat(link); st.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("the link was replaced")
 	}
 }

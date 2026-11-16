@@ -377,23 +377,50 @@ func TestDestinationAliasToInheritedDescriptor(t *testing.T) {
 	defer f.Close()
 	f.WriteString("old\n")
 	before, _ := f.Stat()
-	sink := filepath.Join(dir, "sink")
-	if err := os.Symlink(fdPath(f), sink); err != nil {
-		t.Fatal(err)
-	}
 	cmd := &cobra.Command{}
 	cmd.SetErr(io.Discard)
-	for _, p := range []string{sink, f.Name()} {
-		if err := writePayloadTo(cmd, p, []byte("new\n"), true); err != nil {
-			t.Fatalf("%s: %v", p, err)
+	for _, target := range []string{fdPath(f), "/proc/self/fd/" + strconv.Itoa(int(f.Fd()))} {
+		if _, err := os.Stat(target); err != nil {
+			continue // no /proc on this OS
+		}
+		sink := filepath.Join(t.TempDir(), "sink")
+		if err := os.Symlink(target, sink); err != nil {
+			t.Fatal(err)
+		}
+		if err := writePayloadTo(cmd, sink, []byte("new\n"), true); err != nil {
+			t.Fatalf("%s: %v", target, err)
 		}
 	}
 	after, err := os.Stat(f.Name())
 	if err != nil || !os.SameFile(before, after) {
 		t.Fatal("the file under the descriptor was replaced")
 	}
-	if raw, _ := os.ReadFile(f.Name()); string(raw) != "old\nnew\nnew\n" {
+	if raw, _ := os.ReadFile(f.Name()); !strings.HasPrefix(string(raw), "old\nnew\n") {
 		t.Fatalf("file %q", raw)
+	}
+}
+
+// An ordinary path is always replaced atomically, even when an inherited
+// descriptor has the file open: the export never inherits stale bytes or an
+// append offset it was not asked for.
+func TestOrdinaryPathIgnoresInheritedDescriptors(t *testing.T) {
+	fakeStd(t)
+	path := filepath.Join(t.TempDir(), "tx.bin")
+	if err := os.WriteFile(path, []byte("a much longer previous payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rw, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rw.Close()
+	cmd := &cobra.Command{}
+	cmd.SetErr(io.Discard)
+	if err := writePayloadTo(cmd, path, []byte("short"), true); err != nil {
+		t.Fatal(err)
+	}
+	if raw, _ := os.ReadFile(path); string(raw) != "short" {
+		t.Fatalf("file %q, want exactly the new payload", raw)
 	}
 }
 

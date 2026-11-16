@@ -20,6 +20,3 @@ func newCtxWriter(_ context.Context, f *os.File) io.Writer { return f }
 func dupFile(fd int, name string) (*os.File, error) {
 	return nil, fmt.Errorf("descriptor paths are not supported on Windows")
 }
-
-// writableFDFor: Windows has no inherited-descriptor paths to alias.
-func writableFDFor(os.FileInfo) (int, bool) { return 0, false }

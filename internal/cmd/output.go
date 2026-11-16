@@ -25,8 +25,9 @@ import (
 //   - anything that is the same file as stderr (and not stdout) is refused,
 //     since bb's own messages go there and would corrupt the payload;
 //   - a path naming another of this process's descriptors (/dev/fd/N,
-//     /proc/self/fd/N), or any path to a file one of them has open for
-//     writing, is written through that descriptor;
+//     /proc/self/fd/N), or a symlink chain leading to one, is written
+//     through that descriptor, keeping its offset and append mode; any
+//     other path is never routed to a descriptor, even if one has it open;
 //   - any other existing non-regular file (a FIFO, a device) is written in
 //     place, since replacing it would cut off whatever reads from it;
 //   - a regular file, or a new path, is replaced atomically through a temp
@@ -67,8 +68,17 @@ func resolveDestination(out string) (destination, error) {
 	// that descriptor: fstat of a pipe matches, where stat of the path may not.
 	fd, isFD := descriptorPath(out)
 	real, evalErr := filepath.EvalSymlinks(out)
+	aliased := false
 	if !isFD && evalErr == nil {
+		// EvalSymlinks walks component by component as the kernel does
+		// (macOS stops at /dev/fd/N, which is not a link there).
 		fd, isFD = descriptorPath(real)
+	}
+	if !isFD {
+		// Linux resolves /proc/self/fd/N to the backing file, so a link to a
+		// descriptor is found by reading the link chain itself.
+		fd, isFD = linkChainDescriptor(out)
+		aliased = isFD
 	}
 	var fst os.FileInfo
 	if isFD {
@@ -80,6 +90,14 @@ func resolveDestination(out string) (destination, error) {
 		_ = f.Close()
 		if err != nil {
 			return destination{}, fmt.Errorf("-o %s: %w", out, err)
+		}
+		if aliased {
+			// The chain was read as text; trust it only if the kernel opens
+			// the very same file through out.
+			kst, kerr := os.Stat(out)
+			if kerr != nil || !os.SameFile(kst, fst) {
+				return destination{}, fmt.Errorf("-o %s: cannot tell whether it names descriptor %d; pass the real destination path", out, fd)
+			}
 		}
 	} else {
 		var err error
@@ -111,12 +129,6 @@ func resolveDestination(out string) (destination, error) {
 	if !fst.Mode().IsRegular() {
 		return destination{kind: destInPlace, path: out}, nil
 	}
-	// A file this process already has open for writing (an inherited
-	// `3>>file`, reached through any alias) is written through that
-	// descriptor, keeping its offset and append mode.
-	if wfd, ok := writableFDFor(fst); ok {
-		return destination{kind: destFD, fd: wfd}, nil
-	}
 	if evalErr != nil {
 		return destination{}, fmt.Errorf("-o %s: %w", out, evalErr)
 	}
@@ -127,6 +139,30 @@ func resolveDestination(out string) (destination, error) {
 		return destination{}, fmt.Errorf("-o %s: cannot determine which file it names; pass the real destination path", out)
 	}
 	return destination{kind: destFile, path: real}, nil
+}
+
+// linkChainDescriptor follows out's symlink chain as text and reports the
+// first link that names a descriptor path (absolute, as /dev/fd/N,
+// /proc/self/fd/N, /dev/stdout and /dev/stderr are). Relative hops are not
+// interpreted: a relative path cannot name one of those. The caller confirms
+// any hit against the kernel's own resolution.
+func linkChainDescriptor(out string) (int, bool) {
+	cur := out
+	for i := 0; i < 40; i++ {
+		st, err := os.Lstat(cur)
+		if err != nil || st.Mode()&os.ModeSymlink == 0 {
+			return 0, false
+		}
+		txt, err := os.Readlink(cur)
+		if err != nil || !filepath.IsAbs(txt) {
+			return 0, false
+		}
+		if fd, ok := descriptorPath(txt); ok {
+			return fd, true
+		}
+		cur = txt
+	}
+	return 0, false
 }
 
 func sameAs(fi os.FileInfo, f *os.File) bool {

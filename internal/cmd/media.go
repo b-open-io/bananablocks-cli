@@ -96,7 +96,8 @@ to.`,
 // directly would truncate (and, on a mid-download error, delete) a
 // pre-existing file at that path even though the download never completed.
 //
-// A symlink destination has its target replaced (the link stays), and a
+// A symlink destination that resolves has its target replaced (the link
+// stays; a dangling one is refused), and a
 // non-regular destination such as a FIFO or a device is written in place,
 // since replacing it would cut off whatever reads from it.
 func saveStream(cmd *cobra.Command, body io.Reader, out, contentType string) error {
@@ -110,15 +111,11 @@ func saveStreamDepth(cmd *cobra.Command, body io.Reader, out, contentType string
 	if st, err := os.Lstat(out); err == nil {
 		switch {
 		case st.Mode()&os.ModeSymlink != 0:
+			// Only a link that resolves is followed; guessing where a
+			// dangling one points could land on an unrelated file.
 			target, err := filepath.EvalSymlinks(out)
 			if err != nil {
-				// A dangling link: write where it points, creating the file.
-				if target, err = os.Readlink(out); err != nil {
-					return err
-				}
-				if !filepath.IsAbs(target) {
-					target = filepath.Join(filepath.Dir(out), target)
-				}
+				return fmt.Errorf("%s is a symbolic link that does not resolve (%v); pass the real destination path", out, err)
 			}
 			return saveStreamDepth(cmd, body, target, contentType, depth+1)
 		case !st.Mode().IsRegular():

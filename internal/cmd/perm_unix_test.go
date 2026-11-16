@@ -107,3 +107,34 @@ func TestPayloadSymlinkLoop(t *testing.T) {
 		t.Fatal("a symlink loop must error")
 	}
 }
+
+// A dangling symlink is refused rather than resolved by guesswork, so the
+// write can never land on an unrelated file.
+func TestPayloadDanglingSymlinkRefused(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "a"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "b", "subdir"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	unrelated := filepath.Join(dir, "a", "result")
+	if err := os.WriteFile(unrelated, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../b/subdir", filepath.Join(dir, "a", "hop")); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "a", "out")
+	if err := os.Symlink("hop/../result", out); err != nil {
+		t.Fatal(err)
+	}
+	cmd := &cobra.Command{}
+	cmd.SetErr(io.Discard)
+	if err := writePayloadTo(cmd, out, []byte("x"), false); err == nil {
+		t.Fatal("a dangling symlink must be refused")
+	}
+	if raw, _ := os.ReadFile(unrelated); string(raw) != "keep" {
+		t.Fatalf("unrelated file overwritten: %q", raw)
+	}
+}

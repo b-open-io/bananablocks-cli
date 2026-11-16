@@ -53,14 +53,43 @@ Configuration:
 func Execute() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
-	err := rootCmd.ExecuteContext(ctx)
+	err := runInterruptible(ctx, func() error { return rootCmd.ExecuteContext(ctx) }, interruptGrace, func() {
+		fmt.Fprintln(os.Stderr, "Error: interrupted")
+		os.Exit(130)
+	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
-		offerUpgradeOn402(ctx, os.Stderr, err)
+		if ctx.Err() == nil {
+			offerUpgradeOn402(ctx, os.Stderr, err)
+		}
 	}
 	return err
 }
 
+// interruptGrace is how long a command may take to wind down after Ctrl-C.
+const interruptGrace = 3 * time.Second
+
+// runInterruptible runs fn and returns its error. Commands watch ctx and
+// return promptly on Ctrl-C, but a write to stdout or a pipe whose reader
+// stopped draining blocks in the kernel where no context reaches it; if fn
+// has not returned within grace of ctx ending, exit is called instead of
+// leaving the process hung.
+func runInterruptible(ctx context.Context, fn func() error, grace time.Duration, exit func()) error {
+	errc := make(chan error, 1)
+	go func() { errc <- fn() }()
+	select {
+	case err := <-errc:
+		return err
+	case <-ctx.Done():
+	}
+	select {
+	case err := <-errc:
+		return err
+	case <-time.After(grace):
+		exit()
+		return ctx.Err()
+	}
+}
 func init() {
 	pf := rootCmd.PersistentFlags()
 	pf.StringVar(&flagHost, "host", "", "server base URL (env BB_HOST, default "+defaultHost+")")

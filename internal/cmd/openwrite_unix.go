@@ -64,3 +64,14 @@ func (w *ctxWriter) Write(p []byte) (int, error) {
 	}
 	return total, nil
 }
+
+// dupFile returns a new *os.File on a duplicate of fd, so closing it (or its
+// GC finalizer) never closes fd itself.
+func dupFile(fd int, name string) (*os.File, error) {
+	nfd, err := syscall.Dup(fd)
+	if err != nil {
+		return nil, err
+	}
+	syscall.CloseOnExec(nfd)
+	return os.NewFile(uintptr(nfd), name), nil
+}

@@ -3,14 +3,17 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -369,5 +372,69 @@ func TestProofKeepsTargetType(t *testing.T) {
 		if err != nil || !strings.Contains(stdout, `"targetType": "`+tt+`"`) {
 			t.Fatalf("%s: stdout %q, %v", tt, stdout, err)
 		}
+	}
+}
+
+// Descriptor paths write through the process's own descriptor (so a `>>`
+// redirect keeps appending) rather than replacing the file behind it.
+func TestDescriptorPathsUseTheDescriptor(t *testing.T) {
+	for _, p := range []string{"/dev/stdout", "/dev/fd/1", "/proc/self/fd/1", "/dev/fd/../fd/1"} {
+		var out bytes.Buffer
+		cmd := &cobra.Command{}
+		cmd.SetOut(&out)
+		cmd.SetErr(io.Discard)
+		if err := writePayloadTo(cmd, p, []byte("abc"), true); err != nil {
+			t.Fatalf("%s: %v", p, err)
+		}
+		if out.String() != "abc" {
+			t.Fatalf("%s: stdout got %q", p, out.String())
+		}
+	}
+	// An appending file descriptor keeps its contents and append mode.
+	f, err := os.OpenFile(filepath.Join(t.TempDir(), "hist"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	f.WriteString("old\n")
+	cmd := &cobra.Command{}
+	cmd.SetErr(io.Discard)
+	if err := writePayloadTo(cmd, fmt.Sprintf("/dev/fd/%d", f.Fd()), []byte("new\n"), true); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(f.Name())
+	if string(raw) != "old\nnew\n" {
+		t.Fatalf("file %q, want the export appended", raw)
+	}
+	// The caller's descriptor is still open and usable afterwards.
+	runtime.GC()
+	runtime.GC()
+	if _, err := f.WriteString("more\n"); err != nil {
+		t.Fatalf("the original descriptor was closed: %v", err)
+	}
+}
+
+// After Ctrl-C a command stuck in a blocked write is abandoned after the
+// grace period instead of hanging the process.
+func TestRunInterruptible(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	block := make(chan struct{})
+	defer close(block)
+	exited := make(chan struct{})
+	go func() {
+		_ = runInterruptible(ctx, func() error { <-block; return nil }, 50*time.Millisecond, func() { close(exited) })
+	}()
+	cancel()
+	select {
+	case <-exited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a blocked command was not abandoned after cancellation")
+	}
+	// A command that winds down within the grace returns its own error.
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	cancel2()
+	err := runInterruptible(ctx2, func() error { return io.EOF }, time.Second, func() { t.Error("exit must not be called") })
+	if err != io.EOF {
+		t.Fatalf("got %v", err)
 	}
 }

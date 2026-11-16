@@ -4,6 +4,7 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 )
@@ -14,3 +15,8 @@ func openForWriteCtx(_ context.Context, path string) (*os.File, error) {
 }
 
 func newCtxWriter(_ context.Context, f *os.File) io.Writer { return f }
+
+// dupFile: Windows has no /dev/fd paths to name a descriptor by.
+func dupFile(fd int, name string) (*os.File, error) {
+	return nil, fmt.Errorf("descriptor paths are not supported on Windows")
+}

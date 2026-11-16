@@ -103,7 +103,64 @@ to.`,
 // non-regular destination such as a FIFO or a device is written in place,
 // since replacing it would cut off whatever reads from it.
 func saveStream(cmd *cobra.Command, body io.Reader, out, contentType string) error {
+	if w, closeFn, ok, err := descriptorWriter(cmd, out); ok {
+		if err != nil {
+			return err
+		}
+		defer closeFn()
+		// A path naming one of this process's descriptors (/dev/stdout,
+		// /dev/fd/N, a process substitution): write through the descriptor
+		// itself, keeping its offset and append mode. Reopening or replacing
+		// the file behind it would clobber what a `>>` redirect accumulated.
+		n, err := io.Copy(w, body)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(cmd.ErrOrStderr(), "wrote %d bytes to %s\n", n, out)
+		return nil
+	}
 	return saveStreamDepth(cmd, body, out, contentType, 0)
+}
+
+// descriptorWriter maps a path that names one of this process's open
+// descriptors to a writer on that descriptor: /dev/stdout, /dev/stderr,
+// /dev/fd/N and /proc/self/fd/N (N >= 0). Other paths return ok=false. For
+// another fd it writes through a duplicate, closed by closeFn: wrapping the
+// borrowed fd itself would let the GC close it (and whatever later reuses
+// its number).
+func descriptorWriter(cmd *cobra.Command, out string) (w io.Writer, closeFn func(), ok bool, err error) {
+	noop := func() {}
+	clean := filepath.Clean(out)
+	switch clean {
+	case "/dev/stdout":
+		return cmd.OutOrStdout(), noop, true, nil
+	case "/dev/stderr":
+		return cmd.ErrOrStderr(), noop, true, nil
+	}
+	var rest string
+	switch {
+	case strings.HasPrefix(clean, "/dev/fd/"):
+		rest = strings.TrimPrefix(clean, "/dev/fd/")
+	case strings.HasPrefix(clean, "/proc/self/fd/"):
+		rest = strings.TrimPrefix(clean, "/proc/self/fd/")
+	default:
+		return nil, nil, false, nil
+	}
+	fd, convErr := strconv.Atoi(rest)
+	if convErr != nil || fd < 0 {
+		return nil, nil, false, nil
+	}
+	switch fd {
+	case 1:
+		return cmd.OutOrStdout(), noop, true, nil
+	case 2:
+		return cmd.ErrOrStderr(), noop, true, nil
+	}
+	f, err := dupFile(fd, clean)
+	if err != nil {
+		return nil, nil, true, fmt.Errorf("%s: %w", clean, err)
+	}
+	return f, func() { _ = f.Close() }, true, nil
 }
 
 func saveStreamDepth(cmd *cobra.Command, body io.Reader, out, contentType string, depth int) error {

@@ -363,3 +363,35 @@ func TestDestinationOtherDescriptorAppends(t *testing.T) {
 		t.Fatalf("file %q", raw)
 	}
 }
+
+// A symlink to an inherited append descriptor (sink -> /dev/fd/3 with
+// 3>>history) appends through it instead of replacing the file under it.
+func TestDestinationAliasToInheritedDescriptor(t *testing.T) {
+	fakeStd(t)
+	dir := t.TempDir()
+	f, err := os.OpenFile(filepath.Join(dir, "history"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	f.WriteString("old\n")
+	before, _ := f.Stat()
+	sink := filepath.Join(dir, "sink")
+	if err := os.Symlink(fdPath(f), sink); err != nil {
+		t.Fatal(err)
+	}
+	cmd := &cobra.Command{}
+	cmd.SetErr(io.Discard)
+	for _, p := range []string{sink, f.Name()} {
+		if err := writePayloadTo(cmd, p, []byte("new\n"), true); err != nil {
+			t.Fatalf("%s: %v", p, err)
+		}
+	}
+	after, err := os.Stat(f.Name())
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatal("the file under the descriptor was replaced")
+	}
+	if raw, _ := os.ReadFile(f.Name()); string(raw) != "old\nnew\nnew\n" {
+		t.Fatalf("file %q", raw)
+	}
+}

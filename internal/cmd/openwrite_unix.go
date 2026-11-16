@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"strconv"
 	"syscall"
 	"time"
 )
@@ -74,4 +75,54 @@ func dupFile(fd int, name string) (*os.File, error) {
 	}
 	syscall.CloseOnExec(nfd)
 	return os.NewFile(uintptr(nfd), name), nil
+}
+
+// writableFDFor returns a descriptor of this process that is open for
+// writing on the same file as fi (say fd 3 from a `3>>history.csv`
+// redirect), so output can go through it instead of replacing the file under
+// it. Descriptors are listed from /dev/fd and compared by identity.
+func writableFDFor(fi os.FileInfo) (int, bool) {
+	// Names only: macOS cannot stat every /dev/fd entry (the listing's own
+	// fd is gone by then), which makes ReadDir fail part-way.
+	dir, err := os.Open("/dev/fd")
+	if err != nil {
+		return 0, false
+	}
+	names, _ := dir.Readdirnames(-1)
+	_ = dir.Close()
+	for _, name := range names {
+		fd, err := strconv.Atoi(name)
+		if err != nil || fd < 0 {
+			continue
+		}
+		var st syscall.Stat_t
+		if syscall.Fstat(fd, &st) != nil {
+			continue
+		}
+		f, err := dupFile(fd, name)
+		if err != nil {
+			continue
+		}
+		fst, serr := f.Stat()
+		_ = f.Close()
+		if serr != nil || !os.SameFile(fst, fi) {
+			continue
+		}
+		flags, err := fcntlGetfl(fd)
+		if err != nil {
+			continue
+		}
+		if acc := flags & syscall.O_ACCMODE; acc == syscall.O_WRONLY || acc == syscall.O_RDWR {
+			return fd, true
+		}
+	}
+	return 0, false
+}
+
+func fcntlGetfl(fd int) (int, error) {
+	r, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(fd), uintptr(syscall.F_GETFL), 0)
+	if errno != 0 {
+		return 0, errno
+	}
+	return int(r), nil
 }

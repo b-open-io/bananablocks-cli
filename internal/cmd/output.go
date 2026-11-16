@@ -25,7 +25,8 @@ import (
 //   - anything that is the same file as stderr (and not stdout) is refused,
 //     since bb's own messages go there and would corrupt the payload;
 //   - a path naming another of this process's descriptors (/dev/fd/N,
-//     /proc/self/fd/N) is written through that descriptor;
+//     /proc/self/fd/N), or any path to a file one of them has open for
+//     writing, is written through that descriptor;
 //   - any other existing non-regular file (a FIFO, a device) is written in
 //     place, since replacing it would cut off whatever reads from it;
 //   - a regular file, or a new path, is replaced atomically through a temp
@@ -109,6 +110,12 @@ func resolveDestination(out string) (destination, error) {
 	}
 	if !fst.Mode().IsRegular() {
 		return destination{kind: destInPlace, path: out}, nil
+	}
+	// A file this process already has open for writing (an inherited
+	// `3>>file`, reached through any alias) is written through that
+	// descriptor, keeping its offset and append mode.
+	if wfd, ok := writableFDFor(fst); ok {
+		return destination{kind: destFD, fd: wfd}, nil
 	}
 	if evalErr != nil {
 		return destination{}, fmt.Errorf("-o %s: %w", out, evalErr)

@@ -101,12 +101,12 @@ func saveStream(cmd *cobra.Command, body io.Reader, out, contentType string) err
 		return err
 	}
 	tmp := f.Name()
-	if err := f.Chmod(0o644); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return err
-	}
+	// The temp file is created 0600 and stays private while it is written;
+	// it gets its final mode only once complete.
 	n, err := io.Copy(f, body)
+	if err == nil {
+		err = f.Chmod(outputMode(out))
+	}
 	if closeErr := f.Close(); err == nil {
 		err = closeErr
 	}
@@ -185,6 +185,16 @@ func init() {
 	f.StringVarP(&mediaOutFile, "output", "o", "", "output file (default <txid>_<vout>.<ext>, or <txid>.<ext> for a bare bfile)")
 	f.BoolVar(&mediaStdout, "stdout", false, "write content bytes to stdout")
 	rootCmd.AddCommand(mediaCmd)
+}
+
+// outputMode is the mode a finished download gets: an existing destination
+// keeps its permissions (a private 0600 file stays private), and a new one
+// gets 0666 minus the process umask, as os.Create would give it.
+func outputMode(out string) os.FileMode {
+	if st, err := os.Stat(out); err == nil && st.Mode().IsRegular() {
+		return st.Mode().Perm()
+	}
+	return 0o666 &^ currentUmask()
 }
 
 // copyOut streams body to the command's stdout.

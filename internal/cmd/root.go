@@ -53,10 +53,17 @@ Configuration:
 func Execute() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
-	err := runInterruptible(ctx, func() error { return rootCmd.ExecuteContext(ctx) }, interruptGrace, func() {
-		fmt.Fprintln(os.Stderr, "Error: interrupted")
-		os.Exit(130)
-	})
+	err := runInterruptible(ctx, func() error { return rootCmd.ExecuteContext(ctx) }, interruptGrace,
+		// Once Ctrl-C has been seen, restore the default handler so a second
+		// one kills the process outright.
+		stop,
+		func() {
+			// The diagnostic must not delay the exit: stderr may be the same
+			// full pipe the command is stuck writing to.
+			go fmt.Fprintln(os.Stderr, "Error: interrupted")
+			time.Sleep(50 * time.Millisecond)
+			os.Exit(130)
+		})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		if ctx.Err() == nil {
@@ -74,13 +81,16 @@ const interruptGrace = 3 * time.Second
 // stopped draining blocks in the kernel where no context reaches it; if fn
 // has not returned within grace of ctx ending, exit is called instead of
 // leaving the process hung.
-func runInterruptible(ctx context.Context, fn func() error, grace time.Duration, exit func()) error {
+func runInterruptible(ctx context.Context, fn func() error, grace time.Duration, onCancel, exit func()) error {
 	errc := make(chan error, 1)
 	go func() { errc <- fn() }()
 	select {
 	case err := <-errc:
 		return err
 	case <-ctx.Done():
+	}
+	if onCancel != nil {
+		onCancel()
 	}
 	select {
 	case err := <-errc:

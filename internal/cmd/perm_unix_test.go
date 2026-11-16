@@ -3,6 +3,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -223,5 +224,28 @@ func TestPayloadSymlinkToFIFO(t *testing.T) {
 	}
 	if st, _ := os.Lstat(link); st.Mode()&os.ModeSymlink == 0 {
 		t.Fatal("the link was replaced")
+	}
+}
+
+// A symlink alias to /dev/stdout is written through stdout, not followed to
+// (and replacing) the file stdout is redirected to.
+func TestPayloadSymlinkToStdoutAlias(t *testing.T) {
+	dir := t.TempDir()
+	sink := filepath.Join(dir, "sink")
+	if err := os.Symlink("/dev/stdout", sink); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetOut(&out)
+	cmd.SetErr(io.Discard)
+	if err := writePayloadTo(cmd, sink, []byte("x"), true); err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != "x" {
+		t.Fatalf("stdout got %q", out.String())
+	}
+	if st, _ := os.Lstat(sink); st.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("the alias was replaced")
 	}
 }

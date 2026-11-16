@@ -103,7 +103,7 @@ to.`,
 // non-regular destination such as a FIFO or a device is written in place,
 // since replacing it would cut off whatever reads from it.
 func saveStream(cmd *cobra.Command, body io.Reader, out, contentType string) error {
-	if w, closeFn, ok, err := descriptorWriter(cmd, out); ok {
+	if w, closeFn, ok, err := destinationDescriptor(cmd, out); ok {
 		if err != nil {
 			return err
 		}
@@ -120,6 +120,47 @@ func saveStream(cmd *cobra.Command, body io.Reader, out, contentType string) err
 		return nil
 	}
 	return saveStreamDepth(cmd, body, out, contentType, 0)
+}
+
+// destinationDescriptor reports whether out leads to one of this process's
+// descriptors, directly (/dev/stdout, /dev/fd/N), through symlinks whose
+// targets name one (sink -> /dev/stdout), or by being the very file stdout or
+// stderr is redirected to. Such a destination is written through the
+// descriptor: following it to the backing file and replacing that would
+// erase what a `>>` redirect accumulated.
+func destinationDescriptor(cmd *cobra.Command, out string) (io.Writer, func(), bool, error) {
+	if w, c, ok, err := descriptorWriter(cmd, out); ok {
+		return w, c, ok, err
+	}
+	cur := out
+	for i := 0; i < 40; i++ {
+		st, err := os.Lstat(cur)
+		if err != nil || st.Mode()&os.ModeSymlink == 0 {
+			break
+		}
+		txt, err := os.Readlink(cur)
+		if err != nil {
+			break
+		}
+		if !filepath.IsAbs(txt) {
+			txt = filepath.Join(filepath.Dir(cur), txt)
+		}
+		if w, c, ok, err := descriptorWriter(cmd, txt); ok {
+			return w, c, ok, err
+		}
+		cur = txt
+	}
+	if fst, err := os.Stat(out); err == nil {
+		for _, std := range []struct {
+			f *os.File
+			w io.Writer
+		}{{os.Stdout, cmd.OutOrStdout()}, {os.Stderr, cmd.ErrOrStderr()}} {
+			if sst, err := std.f.Stat(); err == nil && os.SameFile(fst, sst) {
+				return std.w, func() {}, true, nil
+			}
+		}
+	}
+	return nil, nil, false, nil
 }
 
 // descriptorWriter maps a path that names one of this process's open

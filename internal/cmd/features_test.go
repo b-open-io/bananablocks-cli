@@ -422,7 +422,7 @@ func TestRunInterruptible(t *testing.T) {
 	defer close(block)
 	exited := make(chan struct{})
 	go func() {
-		_ = runInterruptible(ctx, func() error { <-block; return nil }, 50*time.Millisecond, func() { close(exited) })
+		_ = runInterruptible(ctx, func() error { <-block; return nil }, 50*time.Millisecond, nil, func() { close(exited) })
 	}()
 	cancel()
 	select {
@@ -433,7 +433,7 @@ func TestRunInterruptible(t *testing.T) {
 	// A command that winds down within the grace returns its own error.
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	cancel2()
-	err := runInterruptible(ctx2, func() error { return io.EOF }, time.Second, func() { t.Error("exit must not be called") })
+	err := runInterruptible(ctx2, func() error { return io.EOF }, time.Second, nil, func() { t.Error("exit must not be called") })
 	if err != io.EOF {
 		t.Fatalf("got %v", err)
 	}

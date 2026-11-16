@@ -120,6 +120,16 @@ bb media <txid>:<vout> --stdout | jq .       # stream to stdout
 bb media <txid> --kind bfile                 # first B:// file (bare b://<txid>)
 ```
 
+### Writing to files (`-o`)
+
+`-o FILE` replaces the file atomically (a failed download never leaves a
+half-written file) and keeps an existing file's permissions. `-o -`, or any
+path that is stdout (`/dev/stdout`, a symlink to it), writes to stdout, so
+`>>` redirects keep appending; `/dev/fd/N` writes through that descriptor; a
+FIFO or device is written in place. A destination that is stderr is refused,
+since bb's messages go there. Default download names (`bb media`,
+`bb token --icon`) never follow an existing symlink.
+
 ### API key & x402 pay-to-upgrade
 
 ```sh

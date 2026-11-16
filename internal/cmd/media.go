@@ -95,7 +95,39 @@ to.`,
 // renamed into place only once the copy fully succeeds: writing the target
 // directly would truncate (and, on a mid-download error, delete) a
 // pre-existing file at that path even though the download never completed.
+//
+// A symlink destination has its target replaced (the link stays), and a
+// non-regular destination such as a FIFO or a device is written in place,
+// since replacing it would cut off whatever reads from it.
 func saveStream(cmd *cobra.Command, body io.Reader, out, contentType string) error {
+	return saveStreamDepth(cmd, body, out, contentType, 0)
+}
+
+func saveStreamDepth(cmd *cobra.Command, body io.Reader, out, contentType string, depth int) error {
+	if depth > 40 {
+		return fmt.Errorf("%s: too many levels of symbolic links", out)
+	}
+	if st, err := os.Lstat(out); err == nil {
+		switch {
+		case st.Mode()&os.ModeSymlink != 0:
+			target, err := filepath.EvalSymlinks(out)
+			if err != nil {
+				// A dangling link: write where it points, creating the file.
+				if target, err = os.Readlink(out); err != nil {
+					return err
+				}
+				if !filepath.IsAbs(target) {
+					target = filepath.Join(filepath.Dir(out), target)
+				}
+			}
+			return saveStreamDepth(cmd, body, target, contentType, depth+1)
+		case !st.Mode().IsRegular():
+			if st.IsDir() {
+				return fmt.Errorf("%s is a directory", out)
+			}
+			return writeInPlace(cmd, body, out, contentType)
+		}
+	}
 	f, err := os.CreateTemp(filepath.Dir(out), ".bb-download-*")
 	if err != nil {
 		return err
@@ -185,6 +217,28 @@ func init() {
 	f.StringVarP(&mediaOutFile, "output", "o", "", "output file (default <txid>_<vout>.<ext>, or <txid>.<ext> for a bare bfile)")
 	f.BoolVar(&mediaStdout, "stdout", false, "write content bytes to stdout")
 	rootCmd.AddCommand(mediaCmd)
+}
+
+// writeInPlace streams body into an existing non-regular file (a FIFO, a
+// device such as /dev/stdout) without replacing it.
+func writeInPlace(cmd *cobra.Command, body io.Reader, out, contentType string) error {
+	f, err := os.OpenFile(out, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	n, err := io.Copy(f, body)
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	if contentType != "" {
+		fmt.Fprintf(cmd.ErrOrStderr(), "wrote %d bytes (%s) to %s\n", n, contentType, out)
+	} else {
+		fmt.Fprintf(cmd.ErrOrStderr(), "wrote %d bytes to %s\n", n, out)
+	}
+	return nil
 }
 
 // outputMode is the mode a finished download gets: an existing destination

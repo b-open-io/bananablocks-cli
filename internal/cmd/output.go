@@ -132,6 +132,14 @@ func resolveDestination(out string) (destination, error) {
 	if evalErr != nil {
 		return destination{}, fmt.Errorf("-o %s: %w", out, evalErr)
 	}
+	// A symlink that ends at a file this process has open for writing may
+	// be an alias of that descriptor we could not trace; replacing the file
+	// would cut it off from the descriptor, so refuse rather than guess.
+	if lst, err := os.Lstat(out); err == nil && lst.Mode()&os.ModeSymlink != 0 {
+		if wfd, ok := writableFDFor(fst); ok {
+			return destination{}, fmt.Errorf("-o %s leads to a file open on descriptor %d; name the descriptor (/dev/fd/%d) or the file itself", out, wfd, wfd)
+		}
+	}
 	// Confirm the resolved path is the very file the kernel opens before
 	// replacing anything.
 	rst, err := os.Stat(real)
@@ -141,11 +149,12 @@ func resolveDestination(out string) (destination, error) {
 	return destination{kind: destFile, path: real}, nil
 }
 
-// linkChainDescriptor follows out's symlink chain as text and reports the
-// first link that names a descriptor path (absolute, as /dev/fd/N,
-// /proc/self/fd/N, /dev/stdout and /dev/stderr are). Relative hops are not
-// interpreted: a relative path cannot name one of those. The caller confirms
-// any hit against the kernel's own resolution.
+// linkChainDescriptor follows out's symlink chain and reports the first link
+// whose text names a descriptor path (/dev/fd/N, /proc/self/fd/N,
+// /dev/stdout, /dev/stderr). Each hop's path is built without lexical
+// cleaning, so the kernel itself resolves any "dir/.." in it, symlinked
+// directories included. The caller confirms a hit against the kernel's own
+// resolution of out.
 func linkChainDescriptor(out string) (int, bool) {
 	cur := out
 	for i := 0; i < 40; i++ {
@@ -154,13 +163,24 @@ func linkChainDescriptor(out string) (int, bool) {
 			return 0, false
 		}
 		txt, err := os.Readlink(cur)
-		if err != nil || !filepath.IsAbs(txt) {
+		if err != nil {
 			return 0, false
 		}
-		if fd, ok := descriptorPath(txt); ok {
-			return fd, true
+		if filepath.IsAbs(txt) {
+			if fd, ok := descriptorPath(txt); ok {
+				return fd, true
+			}
+			cur = txt
+			continue
 		}
-		cur = txt
+		parent := "."
+		if i := strings.LastIndex(cur, string(filepath.Separator)); i >= 0 {
+			parent = cur[:i]
+			if parent == "" {
+				parent = string(filepath.Separator)
+			}
+		}
+		cur = parent + string(filepath.Separator) + txt
 	}
 	return 0, false
 }

@@ -463,3 +463,69 @@ func TestGeneratedNameDoesNotFollowSymlink(t *testing.T) {
 		}
 	}
 }
+
+// A relative symlink chain to an inherited descriptor (sink -> fdlink ->
+// /dev/fd/N) is traced and appends through the descriptor.
+func TestDestinationRelativeChainToDescriptor(t *testing.T) {
+	fakeStd(t)
+	dir := t.TempDir()
+	f, err := os.OpenFile(filepath.Join(dir, "history"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	f.WriteString("old\n")
+	before, _ := f.Stat()
+	targets := []string{fdPath(f)}
+	if _, err := os.Stat("/proc/self/fd"); err == nil {
+		targets = append(targets, "/proc/self/fd/"+strconv.Itoa(int(f.Fd())))
+	}
+	cmd := &cobra.Command{}
+	cmd.SetErr(io.Discard)
+	for i, target := range targets {
+		sub := filepath.Join(dir, "links"+strconv.Itoa(i))
+		if err := os.MkdirAll(sub, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, filepath.Join(sub, "fdlink")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("fdlink", filepath.Join(sub, "sink")); err != nil {
+			t.Fatal(err)
+		}
+		if err := writePayloadTo(cmd, filepath.Join(sub, "sink"), []byte("new\n"), true); err != nil {
+			t.Fatalf("%s: %v", target, err)
+		}
+	}
+	after, _ := os.Stat(f.Name())
+	if !os.SameFile(before, after) {
+		t.Fatal("the file under the descriptor was replaced")
+	}
+	if raw, _ := os.ReadFile(f.Name()); !strings.HasPrefix(string(raw), "old\nnew\n") {
+		t.Fatalf("file %q", raw)
+	}
+}
+
+// A symlink to a file this process holds open for writing, but which bb
+// cannot trace to a descriptor, is refused rather than replaced.
+func TestDestinationUntraceableAliasRefused(t *testing.T) {
+	fakeStd(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "history")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink("history", link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveDestination(link); err == nil || !strings.Contains(err.Error(), "open on descriptor") {
+		t.Fatalf("got %v", err)
+	}
+	// The plain path is still replaced normally.
+	if d, err := resolveDestination(path); err != nil || d.kind != destFile {
+		t.Fatalf("plain path: %+v, %v", d, err)
+	}
+}

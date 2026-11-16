@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"strconv"
 	"syscall"
 	"time"
 )
@@ -74,4 +75,39 @@ func dupFile(fd int, name string) (*os.File, error) {
 	}
 	syscall.CloseOnExec(nfd)
 	return os.NewFile(uintptr(nfd), name), nil
+}
+
+// writableFDFor returns a descriptor of this process open for writing on the
+// same file as fi. Descriptors are listed by name from /dev/fd (macOS cannot
+// stat every entry there) and compared by identity.
+func writableFDFor(fi os.FileInfo) (int, bool) {
+	dir, err := os.Open("/dev/fd")
+	if err != nil {
+		return 0, false
+	}
+	names, _ := dir.Readdirnames(-1)
+	_ = dir.Close()
+	for _, name := range names {
+		fd, err := strconv.Atoi(name)
+		if err != nil || fd < 0 {
+			continue
+		}
+		f, err := dupFile(fd, name)
+		if err != nil {
+			continue
+		}
+		fst, serr := f.Stat()
+		_ = f.Close()
+		if serr != nil || !os.SameFile(fst, fi) {
+			continue
+		}
+		r, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(fd), uintptr(syscall.F_GETFL), 0)
+		if errno != 0 {
+			continue
+		}
+		if acc := int(r) & syscall.O_ACCMODE; acc == syscall.O_WRONLY || acc == syscall.O_RDWR {
+			return fd, true
+		}
+	}
+	return 0, false
 }

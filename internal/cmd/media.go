@@ -81,11 +81,10 @@ to.`,
 			_, err := io.Copy(cmd.OutOrStdout(), body)
 			return err
 		}
-		out := mediaOutFile
-		if out == "" {
-			out = defaultName + extForContentType(contentType)
+		if mediaOutFile == "" {
+			return saveGenerated(cmd, body, defaultName+extForContentType(contentType), contentType)
 		}
-		return saveStream(cmd, body, out, contentType)
+		return saveStream(cmd, body, mediaOutFile, contentType)
 	},
 }
 

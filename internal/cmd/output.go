@@ -172,6 +172,34 @@ func checkOutputDestination(out string) error {
 	return err
 }
 
+// saveGenerated saves a download under a name bb made up (no -o). Unlike an
+// explicit destination it never follows what is already there: an existing
+// entry of that name, symlink or not, is replaced as a directory entry, so a
+// planted link cannot redirect the download onto another file.
+func saveGenerated(cmd *cobra.Command, body io.Reader, name, contentType string) error {
+	mode := 0o666 &^ currentUmask()
+	if st, err := os.Lstat(name); err == nil {
+		if st.IsDir() {
+			return fmt.Errorf("%s is a directory; pass -o", name)
+		}
+		if st.Mode().IsRegular() {
+			mode = st.Mode().Perm()
+		}
+	}
+	n, err := replaceFile(body, name, mode)
+	if err != nil {
+		return err
+	}
+	desc := ""
+	if contentType != "" {
+		desc = " (" + contentType + ")"
+	}
+	if _, err := fmt.Fprintf(cmd.ErrOrStderr(), "wrote %d bytes%s to %s\n", n, desc, name); err != nil {
+		return fmt.Errorf("reporting the write: %w", err)
+	}
+	return nil
+}
+
 // saveStream writes body to out as resolveDestination directs and reports
 // the byte count on stderr.
 func saveStream(cmd *cobra.Command, body io.Reader, out, contentType string) error {
@@ -194,7 +222,7 @@ func saveStream(cmd *cobra.Command, body io.Reader, out, contentType string) err
 	case destInPlace:
 		n, err = writeInPlace(cmd, body, d.path)
 	case destFile:
-		n, err = replaceFile(body, d.path)
+		n, err = replaceFile(body, d.path, outputMode(d.path))
 	}
 	if err != nil {
 		return err
@@ -211,9 +239,8 @@ func saveStream(cmd *cobra.Command, body io.Reader, out, contentType string) err
 
 // replaceFile copies body into a 0600 temp file next to path and renames it
 // over path only once the copy fully succeeds, so a failed download never
-// truncates an existing file. The result keeps an existing file's mode, or
-// gets 0666 minus the umask when new.
-func replaceFile(body io.Reader, path string) (int64, error) {
+// truncates an existing file. The finished file gets mode.
+func replaceFile(body io.Reader, path string, mode os.FileMode) (int64, error) {
 	f, err := os.CreateTemp(filepath.Dir(path), ".bb-download-*")
 	if err != nil {
 		return 0, err
@@ -221,7 +248,7 @@ func replaceFile(body io.Reader, path string) (int64, error) {
 	tmp := f.Name()
 	n, err := io.Copy(f, body)
 	if err == nil {
-		err = f.Chmod(outputMode(path))
+		err = f.Chmod(mode)
 	}
 	if cerr := f.Close(); err == nil {
 		err = cerr

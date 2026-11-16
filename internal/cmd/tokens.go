@@ -156,11 +156,10 @@ func tokenIconDownload(cmd *cobra.Command, path, tokenID string) error {
 		_, err := copyOut(cmd, body)
 		return err
 	}
-	out := tokenOutFile
-	if out == "" {
-		out = safeFileName(tokenID) + extForContentType(ct)
+	if tokenOutFile == "" {
+		return saveGenerated(cmd, body, safeFileName(tokenID)+extForContentType(ct), ct)
 	}
-	return saveStream(cmd, body, out, ct)
+	return saveStream(cmd, body, tokenOutFile, ct)
 }
 
 // safeFileName keeps letters, digits, '_' and '-' (anything else becomes '_'), so a token id can

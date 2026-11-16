@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -393,5 +394,45 @@ func TestDestinationAliasToInheritedDescriptor(t *testing.T) {
 	}
 	if raw, _ := os.ReadFile(f.Name()); string(raw) != "old\nnew\nnew\n" {
 		t.Fatalf("file %q", raw)
+	}
+}
+
+// A default download name never follows a planted symlink onto another file.
+func TestGeneratedNameDoesNotFollowSymlink(t *testing.T) {
+	dir := t.TempDir()
+	victim := filepath.Join(dir, "config")
+	if err := os.WriteFile(victim, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rs := newRecordingServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		io.WriteString(w, "payload")
+	})
+	wd, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(wd)
+	txid := strings.Repeat("ab", 32)
+	if err := os.Symlink(victim, txid+"_0.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, "tok_0.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := runBB(t, rs.srv.URL, "media", txid+":0"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := runBB(t, rs.srv.URL, "token", "tok_0", "--icon"); err != nil {
+		t.Fatal(err)
+	}
+	if raw, _ := os.ReadFile(victim); string(raw) != "keep" {
+		t.Fatalf("symlink target overwritten: %q", raw)
+	}
+	for _, n := range []string{txid + "_0.txt", "tok_0.txt"} {
+		st, err := os.Lstat(n)
+		if err != nil || !st.Mode().IsRegular() {
+			t.Fatalf("%s should now be a regular file", n)
+		}
 	}
 }

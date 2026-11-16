@@ -249,3 +249,21 @@ func TestPayloadSymlinkToStdoutAlias(t *testing.T) {
 		t.Fatal("the alias was replaced")
 	}
 }
+
+// A symlink to /dev/stderr is refused too.
+func TestStderrSymlinkRefused(t *testing.T) {
+	sink := filepath.Join(t.TempDir(), "sink")
+	if err := os.Symlink("/dev/stderr", sink); err != nil {
+		t.Fatal(err)
+	}
+	cmd := &cobra.Command{}
+	var errb bytes.Buffer
+	cmd.SetErr(&errb)
+	cmd.SetOut(io.Discard)
+	if err := writePayloadTo(cmd, sink, []byte("x"), false); err == nil {
+		t.Fatal("a symlink to stderr must be refused")
+	}
+	if errb.Len() != 0 {
+		t.Fatalf("payload reached stderr: %q", errb.String())
+	}
+}

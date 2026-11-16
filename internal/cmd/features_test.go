@@ -438,3 +438,19 @@ func TestRunInterruptible(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+// -o pointing at stderr is refused before anything is written, so bb's own
+// messages cannot end up inside the payload.
+func TestStderrDestinationRefused(t *testing.T) {
+	const txid = "0e3e2357e806b6cdb1f70b54c3a3a17b6714ee1f0e68bebb44a74b1efd512098"
+	rs := newRecordingServer(t, nil)
+	for _, p := range []string{"/dev/stderr", "/dev/fd/2", "/proc/self/fd/2"} {
+		_, _, err := runBB(t, rs.srv.URL, "tx", txid, "--bin", "-o", p)
+		if err == nil || !strings.Contains(err.Error(), "leads to stderr") {
+			t.Fatalf("%s: got %v", p, err)
+		}
+	}
+	if got := rs.requests(); len(got) != 0 {
+		t.Fatalf("refused destinations still fetched %v", got)
+	}
+}

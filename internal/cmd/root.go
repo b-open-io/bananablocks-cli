@@ -53,7 +53,18 @@ Configuration:
 func Execute() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
-	err := runInterruptible(ctx, func() error { return rootCmd.ExecuteContext(ctx) }, interruptGrace,
+	// Error reporting (and the upgrade offer) run inside the watchdog too: a
+	// write to a stderr pipe nobody drains must not outlive Ctrl-C either.
+	return runInterruptible(ctx, func() error {
+		err := rootCmd.ExecuteContext(ctx)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			if ctx.Err() == nil {
+				offerUpgradeOn402(ctx, os.Stderr, err)
+			}
+		}
+		return err
+	}, interruptGrace,
 		// Once Ctrl-C has been seen, restore the default handler so a second
 		// one kills the process outright.
 		stop,
@@ -64,13 +75,6 @@ func Execute() error {
 			time.Sleep(50 * time.Millisecond)
 			os.Exit(130)
 		})
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "Error:", err)
-		if ctx.Err() == nil {
-			offerUpgradeOn402(ctx, os.Stderr, err)
-		}
-	}
-	return err
 }
 
 // interruptGrace is how long a command may take to wind down after Ctrl-C.
@@ -114,6 +118,11 @@ func init() {
 		}
 		if err := validateHost(); err != nil {
 			return err
+		}
+		if f := cmd.Flags().Lookup("output"); f != nil && f.Value.String() != "" {
+			if err := refuseStderrDestination(cmd, f.Value.String()); err != nil {
+				return err
+			}
 		}
 		return validateChain()
 	}

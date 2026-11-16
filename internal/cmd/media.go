@@ -103,6 +103,9 @@ to.`,
 // non-regular destination such as a FIFO or a device is written in place,
 // since replacing it would cut off whatever reads from it.
 func saveStream(cmd *cobra.Command, body io.Reader, out, contentType string) error {
+	if err := refuseStderrDestination(cmd, out); err != nil {
+		return err
+	}
 	if w, closeFn, ok, err := destinationDescriptor(cmd, out); ok {
 		if err != nil {
 			return err
@@ -161,6 +164,27 @@ func destinationDescriptor(cmd *cobra.Command, out string) (io.Writer, func(), b
 		}
 	}
 	return nil, nil, false, nil
+}
+
+// refuseStderrDestination rejects an -o destination that leads to stderr
+// (/dev/stderr, /dev/fd/2, a symlink to one, or the file stderr is redirected
+// to): bb's diagnostics go there too and would corrupt the payload. It runs
+// before the command prints anything.
+func refuseStderrDestination(cmd *cobra.Command, out string) error {
+	if out == "-" {
+		return nil
+	}
+	err := fmt.Errorf("-o %s leads to stderr, where bb also writes its messages; use -o - (stdout) or a file", out)
+	w, closeFn, ok, _ := destinationDescriptor(cmd, out)
+	if ok {
+		if closeFn != nil {
+			closeFn()
+		}
+		if w == cmd.ErrOrStderr() && w != cmd.OutOrStdout() {
+			return err
+		}
+	}
+	return nil
 }
 
 // descriptorWriter maps a path that names one of this process's open

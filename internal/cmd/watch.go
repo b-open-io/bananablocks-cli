@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -31,24 +33,34 @@ const (
 
 var watchCmd = &cobra.Command{
 	Use:   "watch [channel...]",
-	Short: "Stream live events over WebSocket (blocks, mempool, address:<addr>, ...)",
+	Short: "Stream live events over WebSocket (blocks, mempool, lock:address:<addr>, ...)",
 	Long: `Subscribe to the server's WebSocket hub and print each event as one JSON
-line. Default channel is "blocks". Channels include:
+line. Default channel is "blocks". The channels are:
 
-  blocks              new blocks and block-stats updates
-  mempool             mempool activity
-  address:<addr>      transactions touching an address
-  scripthash:<hash>   transactions touching a script hash
+  blocks                     new blocks and block-stats updates
+  mempool                    mempool activity
+  lock:address:<addr>        transactions paying to an address
+  spend:address:<addr>       transactions spending from an address
+  lock:scripthash:<hash>     transactions paying to a script hash (64 lowercase hex)
+  spend:scripthash:<hash>    transactions spending from a script hash
+  tx:<txid>                  updates for one transaction (64 lowercase hex)
+
+A channel the server rejects ends the command with its error.
 
 The connection is re-established automatically unless --no-reconnect is
 set. Interrupt (Ctrl-C) to stop.`,
 	Example: `  bb watch
   bb watch blocks mempool
-  bb watch address:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa`,
+  bb watch lock:address:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		channels := args
 		if len(channels) == 0 {
 			channels = []string{"blocks"}
+		}
+		for _, ch := range channels {
+			if err := validateWatchChannel(ch); err != nil {
+				return err
+			}
 		}
 
 		wsURL, err := websocketURL(host())
@@ -63,7 +75,8 @@ set. Interrupt (Ctrl-C) to stop.`,
 			if ctx.Err() != nil {
 				return nil // interrupted
 			}
-			if watchNoReconnect {
+			var rejected *channelRejectedError
+			if watchNoReconnect || errors.As(err, &rejected) {
 				return err
 			}
 			// A connection that stayed up long enough to be healthy resets the
@@ -176,8 +189,59 @@ func streamOnce(cmd *cobra.Command, wsURL string, channels []string) (time.Durat
 		if err != nil {
 			return time.Since(connectedAt), err
 		}
+		if err := rejectedChannel(msg); err != nil {
+			return time.Since(connectedAt), err
+		}
 		fmt.Fprintln(cmd.OutOrStdout(), string(msg))
 	}
+}
+
+// channelRejectedError is the server refusing a subscribe channel's name.
+// Reconnecting cannot fix it, so the watch loop exits instead of idling on a
+// subscription that never receives events.
+type channelRejectedError struct{ msg string }
+
+func (e *channelRejectedError) Error() string { return "server rejected the subscription: " + e.msg }
+
+// rejectedChannel reports a server error frame that rejects a channel name
+// ({"error":"invalid subscribe channel: <ch>"}); every other frame is nil.
+func rejectedChannel(msg []byte) error {
+	var frame struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(msg, &frame) != nil || !strings.HasPrefix(frame.Error, "invalid subscribe channel: ") {
+		return nil
+	}
+	return &channelRejectedError{msg: frame.Error}
+}
+
+// validateWatchChannel checks a channel against the server's subscribe grammar
+// (blocks, mempool, lock|spend:address:<addr>, lock|spend:scripthash:<hex>,
+// tx:<hex>) so a misspelt name fails before connecting. Address checksums are
+// left to the server, whose rejection also ends the command.
+func validateWatchChannel(ch string) error {
+	ok := false
+	switch {
+	case ch == "blocks", ch == "mempool":
+		ok = true
+	case strings.HasPrefix(ch, "tx:"):
+		ok = isLowerHex64(strings.TrimPrefix(ch, "tx:"))
+	case strings.HasPrefix(ch, "lock:"), strings.HasPrefix(ch, "spend:"):
+		_, sel, _ := strings.Cut(ch, ":")
+		if addr, isAddr := strings.CutPrefix(sel, "address:"); isAddr {
+			ok = addr != ""
+		} else if sh, isSH := strings.CutPrefix(sel, "scripthash:"); isSH {
+			ok = isLowerHex64(sh)
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid channel %q: want blocks, mempool, lock:address:<addr>, spend:address:<addr>, lock:scripthash:<hash>, spend:scripthash:<hash> or tx:<txid> (hashes and txids in 64 lowercase hex)", truncateArg(ch))
+	}
+	return nil
+}
+
+func isLowerHex64(s string) bool {
+	return len(s) == 64 && hexRe.MatchString(s) && s == strings.ToLower(s)
 }
 
 func init() {

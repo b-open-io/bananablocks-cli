@@ -133,9 +133,12 @@ func (w *Wallet) BuildPayment(ctx context.Context, c *api.Client, ch *Challenge,
 
 	// Page through UTXOs (largest pages the API allows) until the target is
 	// covered. The legacy page path caps out at offset 1000, which is far more
-	// coin selection than a tier purchase should ever need.
+	// coin selection than a tier purchase should ever need. p2pkh_only=true
+	// fetches bare-P2PKH coins only: the default view also lists outputs that
+	// wrap the address's P2PKH in an inscription envelope, which report
+	// script_type "p2pkh" but cannot be signed against w.lockHex.
 	for page := 0; page < 10 && total < fundingTarget(ch.AmountSats, selected, feeRate); page++ {
-		q := url.Values{"page": {strconv.Itoa(page)}, "limit": {"100"}}
+		q := url.Values{"page": {strconv.Itoa(page)}, "limit": {"100"}, "p2pkh_only": {"true"}}
 		var utxos []utxo
 		if err := c.GetJSON(ctx, "/api/v1/address/"+url.PathEscape(w.Address)+"/utxos", q, &utxos); err != nil {
 			return nil, fmt.Errorf("fetching UTXOs for %s: %w", w.Address, err)

@@ -77,3 +77,26 @@ func TestBytesRejectsOversized(t *testing.T) {
 		t.Fatalf("expected an over-cap error, got %v", err)
 	}
 }
+
+// TestPaymentAcceptOnlyWithAPIKey: an anonymous caller's rate-limit 402 has no
+// challenge to pay, so only keyed requests advertise x402 and anonymous ones
+// keep the plain 429.
+func TestPaymentAcceptOnlyWithAPIKey(t *testing.T) {
+	for _, tc := range []struct {
+		key  string
+		want string
+	}{{"", ""}, {"bb_test_k", "x402"}} {
+		var got string
+		c := newTestClient(t, func(rw http.ResponseWriter, r *http.Request) {
+			got = r.Header.Get("X-Payment-Accept")
+			rw.Write([]byte(`{}`))
+		})
+		c.APIKey = tc.key
+		if err := c.GetJSON(context.Background(), "/x", nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		if got != tc.want {
+			t.Fatalf("key %q: X-Payment-Accept = %q, want %q", tc.key, got, tc.want)
+		}
+	}
+}

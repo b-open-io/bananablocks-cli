@@ -328,3 +328,42 @@ func TestBuildPaymentNeverEmitsZeroChange(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildPaymentRequestsBareP2PKHOnly guards coin selection against
+// inscription-wrapped P2PKH outputs: the default UTXO view reports them as
+// script_type "p2pkh", so only the strict p2pkh_only view may be used.
+func TestBuildPaymentRequestsBareP2PKHOnly(t *testing.T) {
+	w, err := NewWallet(testWIF, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("p2pkh_only") != "true" {
+			// What the default view would add: a wrapped coin labelled p2pkh.
+			json.NewEncoder(rw).Encode([]map[string]any{
+				{"txid": strings.Repeat("44", 32), "vout": 0, "value": int64(100000), "script_type": "p2pkh"},
+			})
+			return
+		}
+		if r.URL.Query().Get("page") != "0" {
+			rw.Write([]byte("[]"))
+			return
+		}
+		json.NewEncoder(rw).Encode([]map[string]any{
+			{"txid": strings.Repeat("55", 32), "vout": 0, "value": int64(5000), "script_type": "p2pkh"},
+		})
+	}))
+	defer srv.Close()
+	c := &api.Client{BaseURL: srv.URL, HTTP: srv.Client()}
+	ch := &Challenge{
+		AmountSats:            1000,
+		PayeeLockingScriptHex: "76a914000000000000000000000000000000000000000088ac",
+	}
+	tx, err := w.BuildPayment(context.Background(), c, ch, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tx.Inputs) != 1 || tx.Inputs[0].SourceTXID.String() != strings.Repeat("55", 32) {
+		t.Fatalf("selected %d inputs, want only the bare-P2PKH coin", len(tx.Inputs))
+	}
+}

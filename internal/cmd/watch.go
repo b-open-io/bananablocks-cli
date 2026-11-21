@@ -45,7 +45,9 @@ line. Default channel is "blocks". The channels are:
   spend:scripthash:<hash>    transactions spending from a script hash
   tx:<txid>                  updates for one transaction (64 lowercase hex)
 
-A channel the server rejects ends the command with its error.
+A channel name the server rejects ends the command with its error. At most
+100 distinct channels can be watched at once (the server's per-connection
+subscription cap).
 
 The connection is re-established automatically unless --no-reconnect is
 set. Interrupt (Ctrl-C) to stop.`,
@@ -53,14 +55,9 @@ set. Interrupt (Ctrl-C) to stop.`,
   bb watch blocks mempool
   bb watch lock:address:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		channels := args
-		if len(channels) == 0 {
-			channels = []string{"blocks"}
-		}
-		for _, ch := range channels {
-			if err := validateWatchChannel(ch); err != nil {
-				return err
-			}
+		channels, err := watchChannels(args)
+		if err != nil {
+			return err
 		}
 
 		wsURL, err := websocketURL(host())
@@ -98,6 +95,36 @@ set. Interrupt (Ctrl-C) to stop.`,
 			}
 		}
 	},
+}
+
+// maxWatchChannels mirrors the server's per-client subscription cap
+// (maxSubscriptionsPerClient). Past it the server answers
+// "subscription rejected for: <ch>" and the channel silently receives nothing,
+// so bb refuses locally instead. Each connection is a fresh client and bb never
+// unsubscribes, so at or under this cap neither server cap can fire.
+const maxWatchChannels = 100
+
+// watchChannels validates and de-duplicates the requested channels (the server
+// accepts a repeated subscription without counting it), defaulting to blocks.
+func watchChannels(args []string) ([]string, error) {
+	if len(args) == 0 {
+		return []string{"blocks"}, nil
+	}
+	seen := make(map[string]bool, len(args))
+	channels := make([]string, 0, len(args))
+	for _, ch := range args {
+		if err := validateWatchChannel(ch); err != nil {
+			return nil, err
+		}
+		if !seen[ch] {
+			seen[ch] = true
+			channels = append(channels, ch)
+		}
+	}
+	if len(channels) > maxWatchChannels {
+		return nil, fmt.Errorf("too many channels: %d distinct (the server allows at most %d per connection)", len(channels), maxWatchChannels)
+	}
+	return channels, nil
 }
 
 // websocketURL converts the HTTP base URL into the /ws endpoint URL.

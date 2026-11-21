@@ -122,7 +122,8 @@ bb watch tx:<txid>                 # updates for one transaction
 One JSON event per line; reconnects automatically. Channels are `blocks`,
 `mempool`, `lock:address:<addr>`, `spend:address:<addr>`,
 `lock:scripthash:<hash>`, `spend:scripthash:<hash>` and `tx:<txid>` (hashes
-and txids in 64 lowercase hex); a channel the server rejects ends the command.
+and txids in 64 lowercase hex); a channel name the server rejects ends the
+command, and at most 100 distinct channels can be watched at once.
 
 ### On-chain content
 

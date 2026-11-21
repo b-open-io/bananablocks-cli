@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -187,4 +187,54 @@ func TestTestnetHostWarning(t *testing.T) {
 		}
 	}
 	resetFlags(rootCmd)
+}
+
+// Channel validation and the channel cap run in `bb watch` itself, before any
+// connection is made.
+func TestWatchRejectsChannelsLocally(t *testing.T) {
+	rs := newRecordingServer(t, nil)
+	_, _, err := runBB(t, rs.srv.URL, "watch", "--no-reconnect", "address:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa")
+	if err == nil || !strings.Contains(err.Error(), "invalid channel") {
+		t.Fatalf("bad channel: got %v, want a local invalid-channel error", err)
+	}
+	many := make([]string, 0, maxWatchChannels+1)
+	for i := 0; i <= maxWatchChannels; i++ {
+		many = append(many, fmt.Sprintf("tx:%064x", i))
+	}
+	_, _, err = runBB(t, rs.srv.URL, append([]string{"watch", "--no-reconnect"}, many...)...)
+	if err == nil || !strings.Contains(err.Error(), "too many channels") {
+		t.Fatalf("%d channels: got %v, want a local cap error", len(many), err)
+	}
+	if got := rs.requests(); len(got) != 0 {
+		t.Fatalf("watch reached the server before rejecting: %v", got)
+	}
+}
+
+// Duplicates do not count toward the cap: the server accepts a repeated
+// subscription without adding it.
+func TestWatchChannelsDeduplicates(t *testing.T) {
+	args := make([]string, 0, 2*maxWatchChannels)
+	for i := 0; i < maxWatchChannels; i++ {
+		ch := fmt.Sprintf("tx:%064x", i)
+		args = append(args, ch, ch)
+	}
+	chs, err := watchChannels(args)
+	if err != nil || len(chs) != maxWatchChannels {
+		t.Fatalf("got %d channels, err %v; want %d", len(chs), err, maxWatchChannels)
+	}
+}
+
+// The testnet-host warning is emitted by an online command run through the
+// root command (PersistentPreRunE), not only by the helper.
+func TestTestnetHostWarningOnOnlineCommand(t *testing.T) {
+	rs := newRecordingServer(t, nil)
+	testHost := strings.Replace(rs.srv.URL, "127.0.0.1", "test.localhost", 1)
+	_, stderr, _ := runBB(t, testHost, "status")
+	if !strings.Contains(stderr, "looks like a testnet host") {
+		t.Fatalf("no testnet warning on stderr: %q", stderr)
+	}
+	_, stderr, _ = runBB(t, testHost, "--chain", "test", "status")
+	if strings.Contains(stderr, "looks like a testnet host") {
+		t.Fatalf("warned despite --chain test: %q", stderr)
+	}
 }

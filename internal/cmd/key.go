@@ -897,11 +897,12 @@ func confirmIO(in io.Reader, errw io.Writer, prompt string) bool {
 }
 
 // offerUpgradeOn402 runs after a command fails with a rate-limit 402 (issued
-// because the API client advertises X-Payment-Accept: x402). If the response
-// carries a challenge it prints the upgrade terms and, when the session is
-// interactive and a funding key is already at hand, offers to pay on the
-// spot; otherwise it points at `bb key upgrade`. Anonymous 402s carry no
-// challenge — the server's "get an API key" hint is already in the error.
+// because the API client advertises X-Payment-Accept: x402 on keyed calls).
+// If the response carries a challenge it prints the upgrade terms and, when
+// the session is interactive and a funding key is already at hand, offers to
+// pay on the spot; otherwise it points at `bb key upgrade`. A 402 without a
+// challenge has nothing to pay and is left as the printed error; anonymous
+// calls do not advertise x402, so they get a plain 429 instead.
 func offerUpgradeOn402(ctx context.Context, errw io.Writer, err error) {
 	var apiErr *api.Error
 	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusPaymentRequired {

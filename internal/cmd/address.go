@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/b-open-io/bananablocks-cli/internal/render"
 	"github.com/spf13/cobra"
 )
 
@@ -29,7 +31,8 @@ var addressCmd = &cobra.Command{
 	Use:   "address <addr>",
 	Short: "Show an address (summary, UTXOs, transactions, balance, tokens)",
 	Long: `Show an address. Native address reads are confirmed-only; mempool-aware
-reads live on the WhatsonChain-compatible API (bb get bsv/main/address/<addr>/unconfirmed/balance).
+reads live on the WhatsonChain-compatible API (bb get bsv/<chain>/address/<addr>/unconfirmed/balance,
+with <chain> main on mainnet and test on testnet).
 
   --txs         confirmed history, oldest first. Continue with --cursor set to
                 the response's next_cursor (or start at --from-height).
@@ -39,6 +42,8 @@ reads live on the WhatsonChain-compatible API (bb get bsv/main/address/<addr>/un
                 of every UTXO on a page, for importing coins with SPV proofs.
                 Binary with -o, hex on stdout; the next page's cursor is
                 printed to stderr.
+  --tokens      BSV-21 balances, at most the 1,000 largest; no paging. A
+                warning on stderr says when the list is incomplete.
   --csv         the 100 most recent transactions as CSV (-o file or stdout).`,
 	Example: `  bb address 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa
   bb address 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa --utxos --limit 50
@@ -80,7 +85,7 @@ reads live on the WhatsonChain-compatible API (bb get bsv/main/address/<addr>/un
 		case addrBalance:
 			return getRender(cmd, base+"/balance", q)
 		case addrTokens:
-			return getRender(cmd, base+"/tokens", q)
+			return addressTokens(cmd, base+"/tokens", seg)
 		}
 		return getRender(cmd, base, q)
 	},
@@ -169,6 +174,44 @@ func addressUTXOsBEEF(cmd *cobra.Command, path string, q url.Values) error {
 	return writeNotes(cmd, notes.String())
 }
 
+// nativeTokenCap is how many balances GET /address/{addr}/tokens returns at
+// most (the largest first); the route has no total, flag or paging.
+const nativeTokenCap = 1000
+
+// addressTokens prints the native token-balance list, then warns on stderr
+// when it is incomplete. The native route cuts the list at the 1,000 largest
+// balances and drops tokens without metadata, so its length is compared with
+// total_count from the WhatsonChain-compatible balance route.
+func addressTokens(cmd *cobra.Command, path, addrSeg string) error {
+	var raw json.RawMessage
+	if err := client().GetJSON(cmd.Context(), path, nil, &raw); err != nil {
+		return err
+	}
+	if err := render.JSON(cmd.OutOrStdout(), raw); err != nil {
+		return err
+	}
+	var tokens []json.RawMessage
+	if err := json.Unmarshal(raw, &tokens); err != nil {
+		return fmt.Errorf("token balances are not a JSON array: %w", err)
+	}
+	wocBalance := "/token/bsv21/" + addrSeg + "/balance"
+	var env struct {
+		TotalCount *int `json:"total_count"`
+	}
+	err := client().GetJSON(cmd.Context(), wocPath(wocBalance), nil, &env)
+	switch {
+	case err == nil && env.TotalCount != nil:
+		if *env.TotalCount > len(tokens) {
+			return writeNotes(cmd, fmt.Sprintf("warning: showing %d of %d tokens (the native route returns at most the %d largest balances and omits tokens without metadata); the full count is on bb get bsv/%s%s\n",
+				len(tokens), *env.TotalCount, nativeTokenCap, flagChain, wocBalance))
+		}
+	case len(tokens) >= nativeTokenCap:
+		return writeNotes(cmd, fmt.Sprintf("warning: %d tokens returned; the list may be truncated (the server caps it at the %d largest balances)\n",
+			len(tokens), nativeTokenCap))
+	}
+	return nil
+}
+
 // writeNotes prints s on stderr, failing when it cannot be written.
 func writeNotes(cmd *cobra.Command, s string) error {
 	if s == "" {
@@ -211,7 +254,7 @@ func init() {
 	f.BoolVar(&addrUTXOsBEEF, "utxos-beef", false, "fetch a page of UTXOs as one BEEF with merkle proofs")
 	f.BoolVar(&addrTxs, "txs", false, "list confirmed transaction history (oldest first)")
 	f.BoolVar(&addrBalance, "balance", false, "show confirmed balance only")
-	f.BoolVar(&addrTokens, "tokens", false, "list token balances")
+	f.BoolVar(&addrTokens, "tokens", false, "list BSV-21 token balances (at most the 1,000 largest; warns when truncated)")
 	f.BoolVar(&addrCSV, "csv", false, "download recent history as CSV")
 	f.IntVar(&addrLimit, "limit", 0, "page size")
 	f.IntVar(&addrPage, "page", 0, "zero-indexed page for --utxos (legacy offset paging)")

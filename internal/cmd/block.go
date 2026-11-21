@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"errors"
+	"fmt"
 	"net/url"
 	"strconv"
 
@@ -22,15 +23,36 @@ var blockCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		path := "/api/v1/block/" + seg
 		if args[0] == "tip" {
-			path = "/api/v1/block/tip"
+			if !blockProtocols {
+				return getRender(cmd, "/api/v1/block/tip", nil)
+			}
+			// The server has no tip/protocols route (it answers 400 "invalid
+			// block identifier"), so resolve the tip to its hash first.
+			if seg, err = tipHash(cmd); err != nil {
+				return err
+			}
 		}
+		path := "/api/v1/block/" + seg
 		if blockProtocols {
 			path += "/protocols"
 		}
 		return getRender(cmd, path, nil)
 	},
+}
+
+// tipHash fetches the chain tip and returns its hash as a path segment.
+func tipHash(cmd *cobra.Command) (string, error) {
+	var tip struct {
+		Hash string `json:"hash"`
+	}
+	if err := client().GetJSON(cmd.Context(), "/api/v1/block/tip", nil, &tip); err != nil {
+		return "", fmt.Errorf("resolving the chain tip: %w", err)
+	}
+	if len(tip.Hash) != 64 || !hexRe.MatchString(tip.Hash) {
+		return "", fmt.Errorf("resolving the chain tip: unexpected block hash %q", truncateArg(tip.Hash))
+	}
+	return tip.Hash, nil
 }
 
 var (
@@ -65,7 +87,7 @@ backwards by passing --from the height below the last block you received.`,
 }
 
 func init() {
-	blockCmd.Flags().BoolVar(&blockProtocols, "protocols", false, "show protocol counts for the block")
+	blockCmd.Flags().BoolVar(&blockProtocols, "protocols", false, "show protocol counts for the block (with tip, for the current tip block)")
 	blocksCmd.Flags().IntVar(&blocksLimit, "limit", 0, "number of blocks to return (max 100)")
 	blocksCmd.Flags().IntVar(&blocksFrom, "from", 0, "start at this block height and page backwards")
 	rootCmd.AddCommand(blockCmd, blocksCmd)

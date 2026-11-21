@@ -108,7 +108,7 @@ func init() {
 	pf := rootCmd.PersistentFlags()
 	pf.StringVar(&flagHost, "host", "", "server base URL (env BB_HOST, default "+defaultHost+")")
 	pf.StringVar(&flagAPIKey, "api-key", "", "API key (env BB_API_KEY)")
-	pf.StringVar(&flagChain, "chain", "main", "chain segment for WhatsonChain-compatible endpoints")
+	pf.StringVar(&flagChain, "chain", "main", "network segment for WhatsonChain-compatible endpoints and the default --verify header service (main|test); use --chain test with a testnet host such as https://test.bananablocks.com, where bsv/main is only a deprecated alias")
 	pf.DurationVar(&flagTimeout, "timeout", 30*time.Second, "HTTP request timeout")
 	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
 		// Offline commands (version, completion, help) contact no server, so a
@@ -124,8 +124,26 @@ func init() {
 				return err
 			}
 		}
-		return validateChain()
+		if err := validateChain(); err != nil {
+			return err
+		}
+		warnTestnetHostOnMain(cmd)
+		return nil
 	}
+}
+
+// warnTestnetHostOnMain notes on stderr that --chain is not inferred from
+// --host: on a testnet host the default main segment is a deprecated alias,
+// and --verify would check testnet proofs against mainnet headers.
+func warnTestnetHostOnMain(cmd *cobra.Command) {
+	if flagChain != "main" {
+		return
+	}
+	u, err := url.Parse(host())
+	if err != nil || !strings.HasPrefix(strings.ToLower(u.Hostname()), "test.") {
+		return
+	}
+	fmt.Fprintf(cmd.ErrOrStderr(), "warning: %s looks like a testnet host but --chain is main; pass --chain test (bsv/main is only a deprecated alias there, and --verify would check proofs against mainnet headers)\n", u.Hostname())
 }
 
 // isOfflineCmd reports whether cmd runs without contacting the server, so

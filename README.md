@@ -31,12 +31,20 @@ make install   # → $GOBIN, versioned via ldflags
 | `--timeout` |              | `30s`                      |
 | `--chain`   |              | `main`                     |
 
+`--chain` is not inferred from `--host`. For a testnet node (e.g.
+`--host https://test.bananablocks.com`) pass `--chain test`; otherwise
+broadcasts use the deprecated `bsv/main` alias and `--verify` checks testnet
+proofs against the mainnet header service, which reports them UNVERIFIED or
+even INVALID. `bb` warns on stderr when the host name starts with `test.` and
+`--chain` is `main`.
+
 ## Commands
 
 ### Query
 
 ```sh
 bb block tip                       # chain tip
+bb block tip --protocols           # protocol counts in the tip block
 bb block 800000                    # block by height or hash
 bb block 800000 --protocols        # protocol counts in the block
 bb blocks --limit 10               # recent blocks (max 100)
@@ -50,7 +58,7 @@ bb address <addr> --utxos --cursor <c>        # deep paging (--page reaches 1000
 bb address <addr> --utxos-beef -o coins.beef  # a page of UTXOs as one BEEF with proofs
 bb address <addr> --txs --from-height 800000  # confirmed history, oldest first
 bb address <addr> --balance        # confirmed balance only
-bb address <addr> --tokens         # BSV-21 token balances
+bb address <addr> --tokens         # BSV-21 token balances (top 1,000; warns if truncated)
 bb address <addr> --csv -o h.csv   # 100 most recent txs as CSV
 bb tokens --limit 50 --page 1      # token list (limit 1-100)
 bb token <tokenId>                 # detail (amounts are strings, smallest unit)
@@ -70,7 +78,8 @@ bb get "blocks?limit=5"            # any API path, pretty-printed
 
 `--verify` recomputes merkle roots **locally** and, by default, confirms them
 against an **independent block-headers service** (a proof-of-work-validated
-chain, chosen per `--chain`; override with `--headers-url`). This means a
+chain, chosen per `--chain` (not per `--host`: pass `--chain test` for testnet
+hosts); override with `--headers-url`). This means a
 matching proof genuinely belongs to the honest chain — a malicious indexer
 can't pass a fabricated proof by also serving a matching header. Pass
 `--no-headers` to fall back to cross-checking against the serving API's own
@@ -106,10 +115,15 @@ already be on the network: resubmit the same hex rather than rebuilding.
 ```sh
 bb watch                           # new blocks (default channel)
 bb watch blocks mempool            # multiple channels
-bb watch address:<addr>            # txs touching an address
+bb watch lock:address:<addr>       # txs paying to an address (spend:address:<addr> for spends)
+bb watch tx:<txid>                 # updates for one transaction
 ```
 
-One JSON event per line; reconnects automatically.
+One JSON event per line; reconnects automatically. Channels are `blocks`,
+`mempool`, `lock:address:<addr>`, `spend:address:<addr>`,
+`lock:scripthash:<hash>`, `spend:scripthash:<hash>` and `tx:<txid>` (hashes
+and txids in 64 lowercase hex); a channel name the server rejects ends the
+command, and at most 100 distinct channels can be watched at once.
 
 ### On-chain content
 
@@ -237,9 +251,13 @@ the payment is gone, and at or above it the payment settled long ago, so it is
 not reported as this run's upgrade. Either way this run buys nothing, and the
 next `bb key upgrade` buys a fresh upgrade or renewal.
 
-`bb` also advertises `X-Payment-Accept: x402` on every API request, so when
-a keyed command gets **rate-limited** the server answers with a payable 402
-challenge instead of a bare 429. `bb` prints the upgrade terms and either
+`bb` also advertises `X-Payment-Accept: x402` on every request made with an
+API key, so when a keyed command gets **rate-limited** the server answers with
+a payable 402 challenge instead of a bare 429 (or a plain 429 when no higher
+tier can be bought). Without an API key the server's 402 would carry no
+challenge, only a hint to create a key, and there would be nothing to pay, so
+anonymous requests do not advertise x402 and keep the plain 429 (which
+`bb broadcast` waits out between batches). `bb` prints the upgrade terms and either
 points you at `bb key upgrade` or — when running interactively with a
 funding key already available — offers to pay the challenge on the spot:
 

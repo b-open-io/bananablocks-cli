@@ -23,7 +23,7 @@ equivalent. Query strings are passed through.`,
 	Example: `  bb get stats/summary
   bb get "blocks?limit=5"
   bb get /api/v1/bsv/main/policy
-  bb get tools/decode --post --data '{"txhex":"01000000..."}'`,
+  bb get tools/decode --post --data '{"rawtx":"01000000..."}'`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		path := args[0]
